@@ -1,0 +1,16 @@
+[package]
+name = "oxalium-infra"
+version = "0.0.0"
+
+edition.workspace = true
+
+[dependencies]
+bytesize.workspace = true
+itertools.workspace = true
+num_cpus.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
