@@ -1,0 +1,640 @@
+# 线程模型
+```mermaid
+flowchart TD
+    %% 样式定义：通过颜色区分不同职责的模块
+    classDef mainNode fill:#eceff1,stroke:#37474f,stroke-width:2px
+    classDef prodNode fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    classDef ringNode fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef ioNode fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    classDef kernelNode fill:#f5f5f5,stroke:#9e9e9e,stroke-dasharray: 5 5
+
+    Main["<b>Main Thread</b><br/>pcr-2601.rs"]:::mainNode
+
+    %% 1. 初始化阶段
+    Main -->|bootstrap| WAL["<b>WalSystem</b>"]:::ringNode
+
+    %% 2. 线程派生阶段
+    Main -->|spawn| TPC
+    Main -->|spawn| SQ
+    Main -->|spawn| CQ
+
+    %% 生产层
+    subgraph Producers [Producer Layer]
+        TPC["<b>TPC Threads</b><br/>(N Threads)"]:::prodNode
+        RT["<b>Tokio Local Runtime</b><br/>(current-thread)"]:::prodNode
+        Tasks["<b>Producer Tasks</b><br/>(x M)"]:::prodNode
+        
+        TPC --> RT --> Tasks
+    end
+
+    %% 缓冲协调层
+    subgraph Coordination [Shared Memory Layer]
+        Ring{{"<b>SlabRing</b><br/>(无锁环形缓冲区)"}}:::ringNode
+    end
+
+    %% 异步 IO 层
+    subgraph IOUring_System [io_uring Subsystem]
+        SQ["<b>SQ Thread</b><br/>(submit slabs)"]:::ioNode
+        IO[("<b>io_uring</b>")]:::ioNode
+        CQ["<b>CQ Thread</b><br/>(complete IO)"]:::ioNode
+        Kernel["<b>Kernel SQPOLL Thread</b>"]:::kernelNode
+        
+        IO -.->|SQPOLL| Kernel
+    end
+
+    %% ==========================================
+    %% 核心 I/O 闭环 (用高亮线条和数字序号标出)
+    %% ==========================================
+    Tasks == "① wal.reserve()" ==> Ring
+    Ring == "② READY slabs" ==> SQ
+    SQ == "③ io_uring submit" ==> IO
+    IO == "④ CQE complete" ==> CQ
+    CQ == "⑤ advance persist cursor" ==> Ring
+    Ring -. "⑥ Notify" .-> Tasks
+```
+# reserve
+
+```mermaid
+graph TD
+    Start([开始 Reserve]) --> Align[容量对齐到 SLAB_PAGE]
+    Align --> LoopStart{开始 Loop 循环}
+    
+    LoopStart --> CheckCursors{"used >= persist + amount? <br/>(是否有空闲 Slab?)"}
+    CheckCursors -- "是 (无空闲)" --> Spin1[记录背压指标, Spin 等待] --> LoopStart
+    CheckCursors -- "否 (有空闲)" --> GetSlab[获取对应 Slab, 引用计数+1]
+    
+    GetSlab --> CheckOwner{"Slab 属主 == 当前游标?"}
+    CheckOwner -- "否 (被并发修改)" --> Release1[释放引用, Spin 等待] --> LoopStart
+    CheckOwner -- "是" --> CheckState{"Slab 状态 == NONE?"}
+    
+    CheckState -- "是" --> TryClaim{"尝试认领 (Try Claim)"}
+    TryClaim -- 失败 --> Release2[释放引用, Spin 等待] --> LoopStart
+    TryClaim -- 成功 --> CheckCancel
+    CheckState -- "否" --> CheckCancel
+    
+    CheckCancel{"Token 被取消?"} -- "是" --> Bail([返回 Cancelled 错误])
+    CheckCancel -- "否" --> PrepareWrite["分配内部空间 (prepare_write)"]
+    
+    PrepareWrite --> Condition{"请求容量与剩余空间的关系"}
+    
+    Condition -- "1. 完全容纳<br/>(assigned + cap <= max)" --> ExactFit{"是否刚好填满?"}
+    ExactFit -- "是" --> AdvCursor1[推进全局游标] --> DoWrite
+    ExactFit -- "否" --> DoWrite[调用 sink 写入数据]
+    
+    DoWrite --> CompleteWrite[完成写入, 释放引用]
+    CompleteWrite --> CheckFull1{"Slab已满?"}
+    CheckFull1 -- "是" --> MarkReady1["标记可刷盘 (mark_ready)"] --> WaitPersist
+    CheckFull1 -- "否" --> WaitPersist
+    
+    WaitPersist{"已持久化?"}
+    WaitPersist -- "否" --> AwaitWaker[异步等待 waker / Spin <br/>直至持久化] --> Success([返回 Ok])
+    WaitPersist -- "是" --> Success
+    
+    Condition -- "2. 放不下，但有剩余<br/>(assigned < max)" --> PadSpace[写入 Padding 填补空白]
+    PadSpace --> CheckFull2[标记满, 推进全局游标] --> LoopStart
+    
+    Condition -- "3. 毫无剩余" --> AdvCursor3[释放引用, 推进全局游标] --> LoopStart
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 用户线程 (调用 reserve)
+    participant SQ as SQ 线程 (提交队列)
+    participant Kernel as Linux 内核 (io_uring)
+    participant CQ as CQ 线程 (完成队列)
+
+    Note over User, CQ: 1. 数据准备阶段
+    User->>User: 在 Slab 中划分空间 (prepare_write)
+    User->>User: 将数据 copy 进 Slab 内存
+    User->>User: Slab 满了！标记为 READY
+    User->>User: 异步挂起 (fut.await)，等待落盘
+
+    Note over User, CQ: 2. I/O 提交阶段
+    loop 轮询扫描
+        SQ->>SQ: 发现刚才那个 READY 的 Slab
+    end
+    SQ->>SQ: 组装写入请求 (SQE)
+    SQ->>Kernel: 提交 I/O 请求 (submit)
+    SQ->>SQ: 标记 Slab 为 IN_FLIGHT
+
+    Note over User, CQ: 3. I/O 完成阶段
+    Kernel->>Kernel: 执行底层 NVMe/SSD 物理写入
+    Kernel->>CQ: 写入完成，生成 CQE 回执
+    
+    loop 轮询检查
+        CQ->>CQ: 收到 CQE 回执
+    end
+    CQ->>CQ: 标记 Slab 为 COMPLETED
+    CQ->>CQ: 推进 persist_cursor (持久化游标)
+    CQ->>User: 唤醒 (notify_waiters)
+    
+    Note over User, CQ: 4. 返回用户
+    User->>User: 被唤醒，检查 is_persisted 为 true
+    User-->>User: 返回 Ok(())，响应客户端
+    
+    CQ->>CQ: 将 Slab 重置为 NONE，循环利用
+```
+
+# 状态机
+
+这组状态机配合 used_cursor、persist_cursor、pending_writers 和 Notify，在并发写入、提交、完成、复用之间建立了闭环，避免重用未完成数据、避免提交空洞、避免遗漏唤醒。
+
+状态机与不变量
+
+- SLAB_NONE：空闲、可认领
+不变量：未被任何写入者认领；assigned/written 已重置为起始值。
+触发：Slab::reuse() 在 CQ 完成并确认无写入者后执行。
+保障点：只有 CQ 线程在完成链路中执行复用，确保不会早于持久化完成。对应 crates/oxalium/src/wal.rs.
+- SLAB_WRITING：写入中
+不变量：只有 owner=Lsn 对应的 slab 允许写入；pending_writers 记录活跃写入者。
+触发：生产者在 reserve() 中通过 try_claim() 从 NONE 进入 WRITING。
+保障点：CAS 防止双重认领；pending_writers 防止 CQ 提前复用。对应 crates/oxalium/src/wal.rs.
+- SLAB_READY：写入完成、等待提交
+不变量：所有预留空间都写完或已填充 padding；written == slab_capacity。
+触发：最后一个写入者写满或 padding 后 mark_ready()。
+保障点：只在 slab 满时进入 READY，避免 SQ 提交“半块”。对应 crates/oxalium/src/wal.rs.
+- SLAB_IN_FLIGHT：已提交给 io_uring
+不变量：已下发写请求到内核；owner 标记已写入 slab header。
+触发：SQ 线程在提交前调用 mark_inflight()。
+保障点：提交与状态转移绑定，避免重复提交同一 slab。对应 crates/oxalium/src/wal.rs.
+- SLAB_COMPLETED：IO 完成，数据已持久化
+不变量：写请求完成；可以推进 persist_cursor，但仍需等待 pending_writers == 0 才能复用。
+触发：CQ 线程处理 CQE 后调用 mark_completed()。
+保障点：CQ 线程是唯一推进持久化游标与复用者，避免提前复用。对应 crates/oxalium/src/wal.rs.
+
+为什么能维持“完美运转”的闭环
+
+1. 写入安全
+    生产者只在 NONE/WRITING 路径上写入，并受 owner 校验保护。这样避免写到别的 LSN 的 slab。对应 crates/oxalium/src/wal.rs.
+2. 提交安全
+    SQ 只扫描 READY slabs，且提交前统一切换到 IN_FLIGHT。这样不会提交部分写入或重复提交。对应 crates/oxalium/src/wal.rs.
+3. 完成安全
+    CQ 只处理 IN_FLIGHT 完成事件，标记 COMPLETED 后由 advance_persisted_lsn() 推进游标，并等待 pending_writers == 0 才复用。这样不会在写入者仍持有时复用 slab。对应 crates/
+    oxalium/src/wal.rs.
+4. 背压与活性
+    当 used_cursor >= persist_cursor + slab_amount，生产者被动等待，保证环形缓冲区不会覆盖未持久化数据。对应 crates/oxalium/src/wal.rs.
+5. 等待与唤醒
+    生产者写完后若未持久化，会等待 slab 的 Notify；CQ 在推进持久化时统一唤醒，保证等待者能继续。对应 crates/oxalium/src/wal.rs.
+
+可验证的系统性结论
+
+- 不会覆写未落盘数据：persist_cursor + slab_amount 形成硬背压。
+- 不会提交不完整 slab：只有 READY 才提交。
+
+如果你想进一步验证“极端竞争下是否可能丢失通知或状态乱序”，我可以基于关键原子操作（compare_exchange/store 的内存序）给出更严谨的并发推理。
+
+前提与符号
+
+- 共享原子变量：
+    - Slab.state：打包 (owner, state)，使用 compare_exchange / store / load。
+    - Slab.pending_writers：活跃写入者计数。
+    - Slab.assigned/written：预分配与已完成写入统计。
+    - SlabRing.used_cursor / persist_cursor：逻辑进度。
+- 关键文件：crates/oxalium/src/wal.rs
+
+1. 认领阶段：NONE -> WRITING 的正确性
+
+- 操作：try_claim() 在 NONE 时使用 compare_exchange(AcqRel, Acquire) 切到 WRITING。
+- 推理：
+    1. CAS 成功意味着当前线程获得“唯一写入权”。
+    2. AcqRel 保证认领之前的写入不会被重排到认领之后，同时后续写入对其他线程可见。
+    3. 失败时返回 (owner, state)，生产者按当前 owner/state 重新判断，避免写入别人的 slab。
+- 结论：不会出现多个写入者同时把同一 NONE slab 变为 WRITING 的情况。
+参考：crates/oxalium/src/wal.rs
+
+2. 写入阶段：assigned/written 的发布
+
+- 操作：
+    - assigned.fetch_add(Relaxed)：仅用于空间分配，不作为跨线程可见性锚点。
+    - written.fetch_add(Release)：写完成后发布。
+- 推理：
+    1. 写数据在用户态内存完成后，再执行 written.fetch_add(Release)，形成“写入数据 happens-before 写完成计数”。
+    2. 任何通过 written 或 state 的 Acquire 观察写完成的线程，都能看到数据已写入内存。
+- 结论：SQ 提交前观察到 READY 或 written == slab_capacity 时，能够看到数据内容已经写好。
+参考：crates/oxalium/src/wal.rs
+
+3. 写满/填充：WRITING -> READY 的发布
+
+- 操作：mark_ready() 使用 state.store(Release)。
+- 推理：
+    1. Release 确保 slab 内存写入与 written 的发布在状态变为 READY 之前对其他线程可见。
+    2. SQ 线程使用 state.load(Acquire) 观察 READY，形成 READY 的可见性边界。
+- 结论：SQ 线程看见 READY 时，看到的数据一定是完整写入或已经 padding。
+参考：crates/oxalium/src/wal.rs
+
+4. 提交阶段：READY -> IN_FLIGHT
+
+- 操作：SQ 线程 mark_inflight() 使用 state.store(Release)。
+- 推理：
+    1. SQ 在提交前将 owner 写入 slab header 并记录 metrics，再 Release 发布状态为 IN_FLIGHT。
+    2. CQ 线程通过完成事件拿到 cursor，调用 mark_completed()，不会依赖旧状态判断。
+- 结论：不会重复提交，也不会出现“完成但未曾提交”的路径。
+参考：crates/oxalium/src/wal.rs
+
+5. 完成阶段：IN_FLIGHT -> COMPLETED
+
+- 操作：CQ 线程 mark_completed() 使用 state.store(Release)。
+- 推理：
+    1. Release 使“IO 完成”在 COMPLETED 对其他线程可见。
+    2. advance_persisted_lsn() 通过 state.load(Acquire) 看到 COMPLETED 后推进 persist_cursor。
+- 结论：persist_cursor 推进不会早于 IO 完成。
+参考：crates/oxalium/src/wal.rs
+
+6. 复用阶段：COMPLETED -> NONE
+
+- 操作：
+    - CQ 线程在 advance_persisted_lsn() 中 load(Acquire) 看到 COMPLETED 后，等待 pending_writers == 0 再 reuse()。
+    - reuse() 以 state.store(Release) 切回 NONE，并重置 assigned/written。
+- 推理：
+    1. pending_writers 的 fetch_sub(Release) 与 CQ 侧的 load(Acquire) 建立同步，防止写入者仍存时复用。
+    2. reuse() 将 assigned/written 重置放在 state.store(Release) 之前，使后续 Acquire 观察到 NONE 时，看到已重置状态。
+- 结论：不会发生“复用早于最后写入者退出”。
+参考：crates/oxalium/src/wal.rs
+
+7. used_cursor / persist_cursor 的进度安全
+
+- used_cursor 通过 compare_exchange(AcqRel, Relaxed) 前进，避免并发写入对 slab 选择出现乱序。
+- persist_cursor 通过 store(Release) 更新，生产者读取 persist_cursor 使用 Acquire，建立背压边界。
+- 结论：生产者不会越过仍在环中的未完成 slab。
+参考：crates/oxalium/src/wal.rs
+
+完整 happens-before 关键链路
+
+1. 生产者写内存 → written.fetch_add(Release)
+2. mark_ready().state.store(Release)
+3. SQ state.load(Acquire) 看到 READY → 提交 → mark_inflight().state.store(Release)
+4. CQ 处理完成 → mark_completed().state.store(Release)
+5. advance_persisted_lsn() state.load(Acquire) 看到 COMPLETED → pending_writers == 0 → reuse().state.store(Release)
+6. 生产者 state.load(Acquire) 看到 NONE / WRITING 时，看到已重置的 assigned/written
+
+```mermaid
+sequenceDiagram
+    participant P as Producer Task
+    participant S as SQ Thread
+    participant C as CQ Thread
+    participant R as Slab/SlabRing
+
+    P->>R: try_claim CAS AcqRel (NONE->WRITING)
+    P->>R: write data (mem)
+    P->>R: written.fetch_add Release
+    P->>R: state.store Release (WRITING->READY)
+
+    S->>R: state.load Acquire sees READY
+    S->>R: state.store Release (READY->IN_FLIGHT)
+    S->>C: io_uring submit
+
+    C->>R: on CQE, state.store Release (IN_FLIGHT->COMPLETED)
+    C->>R: state.load Acquire sees COMPLETED
+    C->>R: wait pending_writers==0 (Acquire)
+    C->>R: reuse(), state.store Release (->NONE)
+
+    P->>R: state.load Acquire sees NONE, assigned/written reset
+```
+
+# 学习路线
+
+### 第 1 步：先写一页“系统目标”
+
+这一页不要写代码，先写下面 4 件事：
+
+1. 系统要解决什么问题
+    把它写成一句话：
+    “多个 producer 并发写日志，先写入预注册内存，再由 SQ/CQ 线程异步刷盘，并在持久化后通知写入方完成。”
+2. 整体线程模型
+    你只需要画 4 个角色：
+    - Main thread
+    - Producer tasks
+    - SQ thread
+    - CQ thread
+3. 一条完整数据流
+    按这个顺序写：
+    - producer 调 reserve
+    - 写进 slab
+    - slab 变 READY
+    - SQ 提交 io_uring
+    - CQ 收到完成
+    - 推进 persist cursor
+    - 唤醒等待者
+4. 这个系统的三个核心约束
+    - 不能覆写未持久化数据
+    - 不能提交半写完的 slab
+    - 不能在 writer 还持有引用时复用 slab
+
+这一步对应的核心入口是：
+pcr-2601.rs
+wal.rs
+
+———
+
+### 第 2 步：先定义最外层接口，再倒推内部结构
+
+这一阶段你先不要写原子逻辑，先写接口草图。
+
+先写这两个对外对象：
+
+
+```rust
+pub struct WalSystem { ... }
+
+impl WalSystem {
+    pub fn create_target(...) -> Result<File>
+    pub fn bootstrap(...) -> Result<(Arc<WalSystem>, SQR, CQR)>
+    pub fn reserve(...) -> impl Future<Output = Result<()>>
+    pub fn inflight(&self) -> usize
+}
+```
+
+为什么先写它：
+
+- 它是系统门面，决定整个项目的“使用方式”
+- 一旦门面定了，下面的 SlabRing、Slab、SQ/CQ 线程职责就更清楚了
+- 你会马上知道哪些状态属于“业务 API”，哪些状态属于“内部调度”
+
+参考：
+wal.rs:666
+
+———
+
+### 第 3 步：设计你必须有的 struct
+
+这一步是核心。这个项目最重要的不是函数，而是 状态归属。
+
+你应该优先把这些 struct 想清楚：
+
+1. WalSystem
+    作用：
+
+- 整个 WAL 子系统的门面
+- 持有 SlabRing
+- 持有注册内存所有权
+- 暴露 reserve() 给 producer
+
+为什么必须单独存在：
+
+- 上层不该直接操作 SlabRing
+- 资源生命周期要集中管理
+- SQ/CQ 线程需要共享同一个系统上下文
+
+2. RegisteredMemory
+    作用：
+
+- 表示一块注册到 io_uring 的固定内存
+- 负责 buffer registration 的资源生命周期
+
+为什么单独拆出来：
+
+- “内存分配”和“slab 状态管理”是两类问题
+- io_uring 注册缓冲区有自己的约束：页对齐、固定大小、slot 编号
+- 这类资源必须用 RAII 管理，Drop 很自然
+
+参考：
+wal.rs:569
+
+3. Slab
+    作用：
+
+- 一个真正承载写入数据的物理块
+- 持有自己的状态、引用计数、写入偏移、唤醒器
+
+为什么它必须是独立对象：
+
+- 并发正确性发生在“单块”粒度上
+- 状态机转移是 per-slab 的，不是全局的
+- 你需要把“可写/可提交/可复用”这些不变量绑在单个 slab 上
+
+Slab 里最该先设计的字段：
+
+- capacity
+- ptr
+- uring_slot
+- state
+- pending_writers
+- assigned
+- written
+- waker
+
+这些字段分别解决：
+
+- 写到哪
+- 给谁提交
+- 当前是什么状态
+- 还有没有 writer 没退场
+- 已经分配了多少空间
+- 真正完成写入了多少
+- 持久化完成后怎么通知
+
+4. SlabRing
+    作用：
+
+- 管理一组 slab 形成环
+- 维护 used_cursor 和 persist_cursor
+- 负责 producer/SQ/CQ 三方协作
+
+为什么不能把这些字段塞回 WalSystem：
+
+- WalSystem 是门面，不该承担全部并发细节
+- ring 才是“并发协议”的拥有者
+- producer reserve、SQ scan、CQ advance 都是围绕 ring 运转
+
+参考：
+wal.rs:281
+
+5. WalSystemMetrics
+    作用：
+
+- 记录背压、竞争、等待这类运行时行为
+
+为什么值得单独有：
+
+- 并发系统没有指标就基本不可调
+- 你需要知道系统是在“正常工作”还是“高争用”
+- 这些指标不是日志，它们是系统行为证据
+
+参考：
+wal.rs:637
+
+———
+
+### 第 4 步：再设计状态机，而不是先写实现
+
+你接下来最该写的不是函数体，而是这一张表：
+
+| 状态 | 含义 | 谁能改 | 为什么存在 |
+|---|---|---|---|
+| NONE | 空闲，可认领 | producer / CQ复用后设置 | 表示可进入下一轮 |
+| WRITING | 正在写 | producer | 避免未写完就提交 |
+| READY | 已写满，待提交 | producer / SQ观察 | 把“写入完成”和“已提交”分开 |
+| IN_FLIGHT | 已提交到内核 | SQ | 防止重复提交 |
+| COMPLETED | IO完成 | CQ | 防止 persist 提前推进 |
+
+为什么这一步必须先做：
+
+- 没有状态图，原子操作就是盲写
+- 并发系统真正的设计不是 API，而是合法状态转移
+- 后面的 compare_exchange、store(Ordering::Release) 都是在实现这张表
+
+———
+
+### 第 5 步：实现顺序要自底而上
+
+如果你要自己重写一个简化版，推荐顺序是：
+
+1. 先写 Slab
+    先实现这些能力：
+
+- inspect
+- try_claim
+- prepare_write
+- complete_write
+- mark_ready
+- mark_inflight
+- mark_completed
+- reuse
+
+原因：
+
+- 这是最小状态单元
+- 没有单块状态机，环形队列只是空壳
+
+2. 再写 SlabRing
+    先实现这些能力：
+
+- slab(cursor)
+- persist_cursor()
+- try_advance_used_cursor()
+- is_persisted()
+- advance_persisted_lsn()
+- fetch_ready_slabs()
+- reserve()
+
+原因：
+
+- ring 是协调层
+- producer/SQ/CQ 三方协议都在这里汇合
+
+3. 再写 RegisteredMemory
+    原因：
+
+- 它偏资源管理，不是协议核心
+- 但跑真实 io_uring 之前必须补上
+
+4. 再写 WalSystem::bootstrap
+    原因：
+
+- 只有底层结构稳定后，启动逻辑才写得清楚
+- 否则你只是在到处传 Arc
+
+5. 最后写 SQ/CQ 线程
+    原因：
+
+- 它们依赖 ring 的“状态可观察性”
+- 本质是消费者，不该先写
+
+———
+
+### 第 6 步：理解 reserve()，这是项目最重要的一段
+
+你应该单独花时间只读这一个流程：
+wal.rs:416
+
+你要把它拆成 6 个问题：
+
+1. 为什么先检查 used_cursor >= persist_cursor + slab_amount
+    因为这是硬背压，保证不会覆写未持久化数据。
+2. 为什么要先 acquire_ref()
+    因为 CQ 不能在 writer 还持有 slab 时复用它。
+3. 为什么要检查 owner != used_cursor
+    因为环上的物理槽位会复用，逻辑 cursor 和物理 index 不能混淆。
+4. 为什么 NONE -> WRITING 要 CAS
+    因为多个 producer 可能同时抢同一个 slab。
+5. 为什么分 assigned 和 written
+    因为“预占空间”和“真正写完”不是一回事。
+    这是并发写入里非常关键的拆分。
+6. 为什么写完后还要等待 persisted
+    因为这个接口语义不是“写入内存成功”，而是“持久化成功”。
+
+如果这 6 个问题你能自己回答，这个项目就不算只是“看过”。
+
+———
+
+### 第 7 步：最后再看内存序，不要提前陷进去
+
+你现在不该一开始研究所有 Acquire/Release/AcqRel。正确顺序是：
+
+1. 先搞清状态机
+2. 再搞清谁写、谁读
+3. 最后问：这个可见性边界应该放在哪
+
+例如：
+
+- mark_ready() 用 Release
+- SQ 观察 READY 用 Acquire
+
+这不是语法细节，而是在表达一句话：
+“数据写完之后，READY 状态才能对别的线程可见。”
+
+———
+
+你应该怎么选：自顶而下还是自底而上
+
+结论很明确：
+
+- 读源码时：自顶而下
+顺序建议：
+pcr-2601.rs
+WalSystem:666
+SlabRing::reserve:416
+fetch_ready_slabs / advance_persisted_lsn
+Slab 状态转移细节
+RegisteredMemory / io_uring 初始化
+- 自己复刻时：自底而上
+顺序建议：
+Slab
+SlabRing
+WalSystem
+SQ/CQ thread
+RegisteredMemory 接真实 io_uring
+压测入口
+
+———
+
+第一周可以怎么学
+
+### Day 1
+
+写出系统目标、线程图、状态图。
+目标不是写代码，是把系统说清楚。
+
+### Day 2
+
+只读 pcr-2601.rs，写出启动流程：
+
+- 创建文件
+- bootstrap
+- producer 启动
+- 统计
+- cancel/shutdown
+
+### Day 3
+
+只读 WalSystem 和 SlabRing 的字段，回答每个字段“归谁管，为什么存在”。
+
+### Day 4
+
+只读 reserve()，自己画出三种分支：
+
+- 放得下
+- 放不下但还能 padding
+- 完全抢不到
+
+### Day 5
+
+只读 SQ/CQ 线程，画出 READY -> IN_FLIGHT -> COMPLETED -> NONE 的闭环。
+
+### Day 6
+
+回头看 Slab 里的原子操作和内存序，验证状态机为什么成立。
+
+### Day 7
+
+自己写一个最小版模型，不接 io_uring，先用内存 mock 跑通状态机。

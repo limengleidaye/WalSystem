@@ -1,0 +1,133 @@
+先建立正确的学习目标
+你要复刻的不是“一个文件”，而是 4 层结构：
+
+1. 压测入口层
+    
+    pcr-2601.rs 负责解析参数、创建文件、启动 WalSystem、启动 producer、打印统计。
+2. WAL 门面层
+    
+    WalSystem 只暴露 create_target、bootstrap、reserve、inflight。
+3. 共享内存协调层
+    
+    核心是 Slab + SlabRing，管理状态机、cursor、背压、唤醒。
+4. IO 执行层
+    
+    SQ 线程负责 submit，CQ 线程负责 complete 和推进 persisted cursor。
+
+从零搭建时的正确顺序
+不要一开始就上 io_uring。在 oxalium-mock 里建议分 5 步。
+
+1. 先搭 crate 骨架
+    
+    在 oxalium-mock 里只保留：
+
+    - lib.rs
+    - wal.rs
+    - 后面再加 bin/mock.rs 做最小入口
+
+2. 先做“单线程、同步刷盘”的最小 WAL
+   
+    第一版只需要：
+
+    - WalSystem::create_target
+    - WalSystem::bootstrap
+    - WalSystem::reserve
+
+    这一版里 reserve 可以直接：
+
+    - 分配一段 buffer
+    - 调用闭包把数据写进去
+    - 直接 pwrite/write_all
+    - 返回 Ok(())
+
+    这一步的目的不是性能，是把 API 形状跑通。
+
+3. 再引入 Slab 概念
+    
+    第二版开始不要每次单独分配 buffer，而是固定大小 slab：
+
+    - 一个 slab 有 capacity
+    - 有 assigned 和 written
+    - 写满才切换下一个 slab
+
+    你这时要先理解 AI_CONTEXT.md 里的这条主线：
+    producer -> reserve -> slab -> ready -> submit -> complete -> persisted
+
+4. 再做 SlabRing
+    
+    第三版把多个 slab 组成环，并引入两个关键 cursor：
+
+    - used_cursor
+    - persist_cursor
+
+    核心规则只有一个：
+    used_cursor < persist_cursor + slab_amount
+    这就是“不会覆盖未落盘数据”的背压边界。
+
+5. 最后才接 io_uring + SQ/CQ 线程
+    第四版再把同步写改成异步提交：
+
+    - SQ 线程扫描 READY
+    - submit 到 io_uring
+    - CQ 线程回收完成事件
+    - 推进 persist_cursor
+    - 唤醒等待中的 producer
+
+这一步才是主项目的性能核心。
+
+你在 oxalium-mock 里应该怎么拆文件
+建议不要把学习版也全塞进一个 wal.rs，可以这样拆：
+
+- src/lib.rs
+- src/wal/mod.rs
+- src/wal/system.rs
+- src/wal/slab.rs
+- src/wal/ring.rs
+- src/wal/io.rs
+- src/bin/mock.rs
+
+这样你会更容易把主项目映射过去。
+
+每一步要验证什么
+每做完一版，都只验证一个问题：
+
+1. 最小同步版
+    
+    验证 reserve 调用链通了，文件里有内容。
+2. slab 版
+    
+    验证多次写入能落到同一个 slab，写满后切换。
+3. ring 版
+    
+    验证在 ring 满时会背压，不会覆写旧 slab。
+4. SQ/CQ 版
+    
+    验证 producer await 后，只有在持久化完成时才返回。
+5. 压测版
+    
+    模仿 [pcr-2601.rs](/home/rust/oxalium/crates/oxalium/src/bin/pcr-2601.rs) 加吞吐、延迟、inflight 统计。
+
+你学习这个项目时最该盯住的源码
+优先顺序建议这样：
+
+1. [AI_CONTEXT.md](/home/rust/oxalium/AI_CONTEXT.md)
+    
+    先理解线程模型、reserve 流程、状态机。
+2. [crates/oxalium/src/bin/pcr-2601.rs](/home/rust/oxalium/crates/oxalium/src/bin/pcr-2601.rs)
+   
+    看外部怎么使用 WalSystem。
+3. [crates/oxalium/src/lib.rs](/home/rust/oxalium/crates/oxalium/src/lib.rs)
+   
+    看导出面有多薄。
+4. [crates/oxalium/src/wal.rs](/home/rust/oxalium/crates/oxalium/src/wal.rs)
+   
+    最后再进实现细节，不然容易淹没。
+
+最重要的认知
+这个项目真正难的不是“写文件”，而是同时满足这三件事：
+
+- producer 并发写入时不互相覆盖
+- SQ/CQ 异步推进时不重复提交、不提前复用
+- 用户 await reserve() 返回时，数据确实已经持久化
+
+如果这三件事你能在 oxalium-mock 里一步步做出来，你就是真的学会了 oxalium。

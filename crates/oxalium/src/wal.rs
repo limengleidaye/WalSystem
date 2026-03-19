@@ -27,6 +27,7 @@ use oxalium_infra::convert::IntoLossy;
 
 use crate::wal::slab::SlabRing;
 
+/// Slab 管理模块，处理 WAL 的底层内存块逻辑
 mod slab {
     use std::{
         cell::UnsafeCell,
@@ -48,18 +49,20 @@ mod slab {
 
     use crate::wal::{CL, REGISTERED_MEMORY_CAPACITY, RegisteredMemory, WalSystemMetrics};
 
-    const SLAB_RESERVED_CAPACITY: usize = 8;
-    const SLAB_PAGE: usize = 64;
+    const SLAB_RESERVED_CAPACITY: usize = 8; // 每个 Slab 开头预留 8 字节存 owner，用于持久化校验
+    const SLAB_PAGE: usize = 64; // 最小写入单位（对齐到 64 字节）
 
-    const SLAB_BITS: usize = 4;
+    const SLAB_BITS: usize = 4; // 状态位占用的位数
     const SLAB_MASK: usize = (1 << SLAB_BITS) - 1;
 
-    const SLAB_NONE: usize = 0;
-    const SLAB_WRITING: usize = 0b0001;
-    const SLAB_READY: usize = 0b0010;
-    const SLAB_IN_FLIGHT: usize = 0b0100;
-    const SLAB_COMPLETED: usize = 0b1000;
+    // Slab 生命周期状态
+    const SLAB_NONE: usize = 0;      // 空闲，可被认领
+    const SLAB_WRITING: usize = 0b0001; // 正在被一个或多个生产者写入
+    const SLAB_READY: usize = 0b0010;   // 写入完成，等待 SQ 线程提交到磁盘
+    const SLAB_IN_FLIGHT: usize = 0b0100; // 已提交给 io_uring，正在执行磁盘 IO
+    const SLAB_COMPLETED: usize = 0b1000; // 磁盘写入已完成，数据已持久化
 
+    // 编译时断言，确保核心结构体对齐到缓存行（64字节），防止伪共享
     const _: () = {
         assert!(std::mem::size_of::<SlabProperties>() == 64);
         assert!(std::mem::size_of::<SlabMetrics>() == 64);
@@ -72,13 +75,15 @@ mod slab {
         assert!(std::mem::align_of::<CL<AtomicUsize>>() == 64);
     };
 
+    /// Slab 的静态属性
     #[repr(align(64))]
     struct SlabProperties {
         capacity: usize,
         ptr: *mut u8,
-        uring_slot: u16,
+        uring_slot: u16, // 对应 io_uring 注册内存的索引
     }
 
+    /// Slab 的运行时指标记录
     #[repr(align(64))]
     struct SlabMetrics {
         mut_inst: UnsafeCell<Instant>,
@@ -86,17 +91,19 @@ mod slab {
         submit_inst: UnsafeCell<Instant>,
     }
 
+    /// 代表 WAL 中的一个物理内存块
     pub struct Slab {
         properties: SlabProperties,
         metrics: SlabMetrics,
-        state: CL<AtomicU64>,
-        pending_writers: CL<AtomicUsize>,
-        assigned: CL<AtomicUsize>,
-        written: CL<AtomicUsize>,
-        waker: Notify,
+        state: CL<AtomicU64>,             // 打包了 owner (lsn) 和 state
+        pending_writers: CL<AtomicUsize>, // 当前活跃的写入者数量（引用计数）
+        assigned: CL<AtomicUsize>,        // 已分配的写入偏移量
+        written: CL<AtomicUsize>,         // 已完成的写入总量
+        waker: Notify,                    // 用于唤醒等待该块持久化的任务
     }
 
     impl Slab {
+        /// 初始化 Slab 向量
         fn build(registered_memories: &[RegisteredMemory], slab_capacity: usize) -> Vec<Slab> {
             let slabs_per_registered_memory = REGISTERED_MEMORY_CAPACITY / slab_capacity;
             registered_memories
@@ -145,10 +152,12 @@ mod slab {
             })
         }
 
+        /// 将逻辑位置和状态打包进 u64
         fn pack(cursor: usize, state: usize) -> u64 {
             (cursor << SLAB_BITS | state & SLAB_MASK).into_lossy()
         }
 
+        /// 从 u64 中解析出逻辑位置 (owner/cursor) 和状态 (state)
         fn unpack(v: u64) -> (usize, usize) {
             let v: usize = v.into_lossy();
             let cursor = v >> SLAB_BITS;
@@ -156,8 +165,10 @@ mod slab {
             (cursor, state)
         }
 
+        /// 标记 Slab 正在进行磁盘 IO
         pub fn mark_inflight(&self, owner: usize) -> Duration {
             let mut_elapsed = unsafe {
+                // 将 owner (LSN) 写入内存块开头，用于故障恢复时的校验
                 *self.properties.ptr.cast::<u64>() = owner.into_lossy();
                 *self.metrics.submit_inst.get() = Instant::now();
                 *self.metrics.mut_elapsed.get()
@@ -167,6 +178,7 @@ mod slab {
             mut_elapsed
         }
 
+        /// 标记 Slab 磁盘 IO 已完成
         pub fn mark_completed(&self, owner: usize) -> Duration {
             let submit_elapsed = unsafe { (*self.metrics.submit_inst.get()).elapsed() };
             self.state
@@ -174,6 +186,7 @@ mod slab {
             submit_elapsed
         }
 
+        /// 生成用于 io_uring 的异步写入指令 (WriteFixed)
         pub fn op_write(&self, slot: u32, cursor: usize) -> squeue::Entry {
             opcode::WriteFixed::new(
                 Fixed(slot),
@@ -182,10 +195,11 @@ mod slab {
                 self.properties.uring_slot,
             )
             .offset((cursor * self.properties.capacity).into_lossy())
-            .rw_flags(libc::RWF_DSYNC)
+            .rw_flags(libc::RWF_DSYNC) // 确保数据持久化到介质
             .build()
         }
 
+        /// 获取 Slab 内指定区域的切片以便写入
         fn b(&self, assigned: usize, capacity: usize) -> &mut [u8] {
             unsafe {
                 let ptr = self.properties.ptr.add(assigned);
@@ -193,18 +207,22 @@ mod slab {
             }
         }
 
+        /// 增加写入者引用计数
         fn acquire_ref(&self) {
             self.pending_writers.fetch_add(1, Ordering::Relaxed);
         }
 
+        /// 减少写入者引用计数
         fn release_ref(&self) {
             self.pending_writers.fetch_sub(1, Ordering::Release);
         }
 
+        /// 查看 Slab 当前的 owner 和状态
         fn inspect(&self) -> (usize, usize) {
             Slab::unpack(self.state.load(Ordering::Acquire))
         }
 
+        /// 尝试通过 CAS “认领”这个 Slab 进入 WRITING 状态
         fn try_claim(&self, owner: usize) -> Result<(), (usize, usize)> {
             match self.state.compare_exchange(
                 Slab::pack(owner, SLAB_NONE),
@@ -222,14 +240,17 @@ mod slab {
             }
         }
 
+        /// 原子地预分配一段空间
         fn prepare_write(&self, capacity: usize) -> usize {
             self.assigned.fetch_add(capacity, Ordering::Relaxed)
         }
 
+        /// 标记一段空间的写入已结束
         fn complete_write(&self, capacity: usize) -> usize {
             self.written.fetch_add(capacity, Ordering::Release) + capacity
         }
 
+        /// 填充剩余空间并完成写入
         fn submit_with_padding(&self, assigned: usize) -> usize {
             let padding = self.properties.capacity - assigned;
             unsafe {
@@ -239,6 +260,7 @@ mod slab {
             self.complete_write(padding)
         }
 
+        /// 标记 Slab 已经填满且就绪，等待提交
         fn mark_ready(&self, owner: usize) {
             unsafe {
                 *self.metrics.mut_elapsed.get() = (*self.metrics.mut_inst.get()).elapsed();
@@ -247,10 +269,12 @@ mod slab {
                 .store(Slab::pack(owner, SLAB_READY), Ordering::Release);
         }
 
+        /// 检查是否所有写入者都已退出且 I/O 已完成
         fn is_reusable(&self) -> bool {
             self.pending_writers.load(Ordering::Acquire) == 0
         }
 
+        /// 重置 Slab 以供在环形缓冲区的下一圈循环使用
         fn reuse(&self, owner: usize) {
             self.assigned
                 .store(SLAB_RESERVED_CAPACITY, Ordering::Relaxed);
@@ -264,12 +288,13 @@ mod slab {
     unsafe impl Send for Slab {}
     unsafe impl Sync for Slab {}
 
+    /// Slab 环形缓冲区管理
     pub struct SlabRing {
         slab_capacity: usize,
         slab_amount: usize,
         slabs: Vec<Slab>,
-        used_cursor: CL<AtomicUsize>,
-        persist_cursor: CL<AtomicUsize>,
+        used_cursor: CL<AtomicUsize>,    // 当前正被生产者使用的 LSN
+        persist_cursor: CL<AtomicUsize>, // 已持久化完成的 LSN
     }
 
     impl SlabRing {
@@ -295,6 +320,7 @@ mod slab {
             &self.slabs[cursor % self.slab_amount]
         }
 
+        /// SQ 线程调用：扫描并收集处于 READY 状态的 Slab 进行批处理提交
         pub fn fetch_ready_slabs(
             &self,
             uring_inflight_limit: usize,
@@ -330,6 +356,7 @@ mod slab {
                 *idle_spins = 0;
                 *submit_cursor = advance_submit_cursor;
             } else {
+                // 如果没有新块就绪，且当前活跃块已超时，则强制退休（Retire）该块
                 let slab = self.slab(advance_submit_cursor);
                 let (owner, state) = slab.inspect();
                 if state == SLAB_WRITING {
@@ -354,6 +381,7 @@ mod slab {
             }
         }
 
+        /// CQ 线程调用：推进已持久化的 LSN 指针
         pub fn advance_persisted_lsn(&self) {
             let mut persist_cursor = self.persist_cursor.load(Ordering::Acquire);
             let mut advanced = false;
@@ -365,12 +393,15 @@ mod slab {
                     break;
                 }
 
+                // 确保异步写入者都已完成
                 while !slab.is_reusable() {
                     spin_loop();
                 }
 
+                // 唤醒所有等待此 LSN 的 future
                 slab.waker.notify_waiters();
 
+                // 重用此物理块供未来的 LSN 使用
                 slab.reuse(persist_cursor + self.slab_amount);
 
                 persist_cursor += 1;
@@ -381,6 +412,7 @@ mod slab {
             }
         }
 
+        /// 生产者入口：保留空间并执行数据写入
         pub async fn reserve(
             &self,
             capacity: usize,
@@ -396,6 +428,8 @@ mod slab {
             loop {
                 let used_cursor = self.used_cursor.load(Ordering::Acquire);
                 let persist_cursor = self.persist_cursor.load(Ordering::Acquire);
+                
+                // 背压机制：如果所有 Slab 都在处理中，产生背压
                 if used_cursor >= persist_cursor + self.slab_amount {
                     metrics.record_backpressure();
                     async_spin_loop(&mut step).await;
@@ -414,6 +448,7 @@ mod slab {
                     continue;
                 }
 
+                // 状态机：如果块还是 NONE，尝试将其切换到 WRITING
                 if state == SLAB_NONE {
                     if let Err((owner, state)) = slab.try_claim(owner) {
                         metrics.record_claim_contention();
@@ -427,23 +462,25 @@ mod slab {
 
                 if cancellation_token.is_cancelled() {
                     slab.release_ref();
-
                     bail!("cancelled");
                 }
 
                 step = 0;
 
+                // 原子预占空间
                 let assigned = slab.prepare_write(capacity);
 
                 if assigned + capacity <= self.slab_capacity {
+                    // 情况 A：空间足够，直接写入
                     if assigned + capacity == self.slab_capacity {
+                        // 刚好填满，尝试推进逻辑游标到下一个 Slab
                         self.try_advance_used_cursor(used_cursor);
                     }
 
+                    // 调用 sink 函数拷贝数据
                     sink(slab.b(assigned, request_capacity));
 
                     let fut = slab.waker.notified();
-
                     let written = slab.complete_write(capacity);
 
                     slab.release_ref();
@@ -452,11 +489,10 @@ mod slab {
                         slab.mark_ready(owner);
                     }
 
+                    // 如果尚未持久化，等待 Notify
                     if !self.is_persisted(used_cursor) {
                         metrics.record_notify_await();
-
                         fut.await;
-
                         while !self.is_persisted(used_cursor) {
                             spin_loop();
                         }
@@ -464,18 +500,16 @@ mod slab {
 
                     return Ok(());
                 } else if assigned < self.slab_capacity {
+                    // 情况 B：当前 Slab 空间不足，执行填充（Padding）并退役此块
                     let written = slab.submit_with_padding(assigned);
-
                     slab.release_ref();
-
                     if written == self.slab_capacity {
                         slab.mark_ready(owner);
                     }
-
                     self.try_advance_used_cursor(used_cursor);
                 } else {
+                    // 情况 C：Slab 已被抢占光，直接尝试下个块
                     slab.release_ref();
-
                     self.try_advance_used_cursor(used_cursor);
                 }
             }
@@ -495,6 +529,7 @@ mod slab {
         }
     }
 
+    /// 异步自旋，逐渐退避
     async fn async_spin_loop(step: &mut usize) {
         const SPIN_LIMIT: usize = 6;
 
@@ -511,31 +546,26 @@ mod slab {
 }
 
 const REGISTERED_MEMORY_PAGE: usize = 4096;
-const REGISTERED_MEMORY_CAPACITY: usize = 16 * 1024 * 1024;
+const REGISTERED_MEMORY_CAPACITY: usize = 16 * 1024 * 1024; // 每个注册内存块固定 16MiB
 
+/// 对齐到 64 字节的包装器
 #[repr(align(64))]
 struct CL<T>(T);
 
 impl<T> Deref for CL<T> {
     type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.0
-    }
+    fn deref(&self) -> &T { &self.0 }
 }
 
 impl<T> DerefMut for CL<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
-    }
+    fn deref_mut(&mut self) -> &mut T { &mut self.0 }
 }
 
 impl<T> From<T> for CL<T> {
-    fn from(value: T) -> CL<T> {
-        CL(value)
-    }
+    fn from(value: T) -> CL<T> { CL(value) }
 }
 
+/// io_uring 注册内存，用于提供高性能、零拷贝的 I/O 缓冲区
 struct RegisteredMemory {
     layout: Layout,
     ptr: *mut u8,
@@ -602,6 +632,7 @@ unsafe impl Sync for RegisteredMemory {}
 pub type SQR = JoinHandle<Result<(Histogram<u64>, Histogram<u64>, Histogram<u64>, f64)>>;
 pub type CQR = JoinHandle<Result<(Histogram<u64>, Histogram<u64>, f64)>>;
 
+/// 全局运行指标统计
 #[derive(Default)]
 pub struct WalSystemMetrics {
     backpressure: UnsafeCell<u64>,
@@ -611,45 +642,15 @@ pub struct WalSystemMetrics {
 }
 
 impl WalSystemMetrics {
-    pub fn backpressure(&self) -> u64 {
-        unsafe { *self.backpressure.get() }
-    }
+    pub fn backpressure(&self) -> u64 { unsafe { *self.backpressure.get() } }
+    pub fn owner_mismatch(&self) -> u64 { unsafe { *self.owner_mismatch.get() } }
+    pub fn claim_contention(&self) -> u64 { unsafe { *self.claim_contention.get() } }
+    pub fn notify_await(&self) -> u64 { unsafe { *self.notify_await.get() } }
 
-    pub fn owner_mismatch(&self) -> u64 {
-        unsafe { *self.owner_mismatch.get() }
-    }
-
-    pub fn claim_contention(&self) -> u64 {
-        unsafe { *self.claim_contention.get() }
-    }
-
-    pub fn notify_await(&self) -> u64 {
-        unsafe { *self.notify_await.get() }
-    }
-
-    fn record_backpressure(&self) {
-        unsafe {
-            *self.backpressure.get() += 1;
-        }
-    }
-
-    fn record_owner_mismatch(&self) {
-        unsafe {
-            *self.owner_mismatch.get() += 1;
-        }
-    }
-
-    fn record_claim_contention(&self) {
-        unsafe {
-            *self.claim_contention.get() += 1;
-        }
-    }
-
-    fn record_notify_await(&self) {
-        unsafe {
-            *self.notify_await.get() += 1;
-        }
-    }
+    fn record_backpressure(&self) { unsafe { *self.backpressure.get() += 1; } }
+    fn record_owner_mismatch(&self) { unsafe { *self.owner_mismatch.get() += 1; } }
+    fn record_claim_contention(&self) { unsafe { *self.claim_contention.get() += 1; } }
+    fn record_notify_await(&self) { unsafe { *self.notify_await.get() += 1; } }
 }
 
 impl AddAssign for WalSystemMetrics {
@@ -661,13 +662,15 @@ impl AddAssign for WalSystemMetrics {
     }
 }
 
+/// WAL 系统门面，负责资源协调和引导
 pub struct WalSystem {
-    _registered_memories: Vec<RegisteredMemory>,
+    _registered_memories: Vec<RegisteredMemory>, // 保持所有权以防止内存释放
     ring: SlabRing,
-    submit_cursor: CL<AtomicUsize>,
+    submit_cursor: CL<AtomicUsize>, // SQ 线程最近提交的 LSN
 }
 
 impl WalSystem {
+    /// 创建并预分配 WAL 目标文件
     pub fn create_target(
         path: impl AsRef<Path>,
         preallocate: usize,
@@ -676,49 +679,35 @@ impl WalSystem {
         const B: usize = 256 * 1024;
 
         let mut options = OpenOptions::new();
-        options
-            .append(false)
-            .create(true)
-            .write(true)
-            .truncate(true);
-        options
-            .custom_flags(libc::O_DIRECT)
-            .custom_flags(libc::O_NOATIME);
+        options.append(false).create(true).write(true).truncate(true);
+        // 使用 O_DIRECT 以绕过内核页缓存，实现极致可控性
+        options.custom_flags(libc::O_DIRECT).custom_flags(libc::O_NOATIME);
 
         let target = options.open(path)?;
         if preallocate != 0 {
             unsafe {
-                let errno = fallocate(
-                    target.as_raw_fd(),
-                    0,
-                    0,
-                    preallocate.cast_signed().into_lossy(),
-                );
-                if errno < 0 {
-                    let err = std::io::Error::last_os_error();
-                    bail!("{}", err);
-                }
+                let errno = fallocate(target.as_raw_fd(), 0, 0, preallocate.cast_signed().into_lossy());
+                if errno < 0 { bail!("{}", std::io::Error::last_os_error()); }
 
                 if use_physical_preallocate {
+                    // 通过实际写入 0 填充，强制文件系统分配物理磁盘块（减少 IO 时的元数据开销）
                     let layout = Layout::from_size_align(B, 4096)?;
                     let ptr = alloc_zeroed(layout);
                     let b = from_raw_parts(ptr, B);
-
                     let mut written = 0;
                     while written < preallocate {
                         target.write_all_at(b, written.into_lossy())?;
                         written += b.len();
                     }
                     target.sync_all()?;
-
                     dealloc(ptr, layout);
                 }
             }
         }
-
         Ok(target)
     }
 
+    /// 启动 WAL 系统，生成控制句柄和对应的 IO 线程
     pub fn bootstrap(
         cancellation_token: CancellationToken,
         target: RawFd,
@@ -751,12 +740,14 @@ impl WalSystem {
         Ok((wal, sq, cq))
     }
 
+    /// 获取当前正在进行磁盘 IO 的数据量（以 Slab 为单位）
     pub fn inflight(&self) -> usize {
         let submit_cursor = self.submit_cursor.load(Ordering::Relaxed);
         let persist_cursor = self.ring.persist_cursor();
         submit_cursor.saturating_sub(persist_cursor)
     }
 
+    /// 生产者核心接口：持久化写入数据
     pub fn reserve(
         &self,
         capacity: usize,
@@ -764,21 +755,22 @@ impl WalSystem {
         metrics: &WalSystemMetrics,
         cancellation_token: &CancellationToken,
     ) -> impl Future<Output = Result<()>> {
-        self.ring
-            .reserve(capacity, sink, metrics, cancellation_token)
+        self.ring.reserve(capacity, sink, metrics, cancellation_token)
     }
 }
 
+/// 配置 io_uring，开启 SQPOLL 模式以减少系统调用
 fn setup_io_uring(target: RawFd, uring_queue_depth: u32) -> Result<IoUring> {
     let mut builder = IoUring::<squeue::Entry, cqueue::Entry>::builder();
     builder.setup_clamp();
     builder.setup_cqsize(uring_queue_depth * 2);
-    builder.setup_sqpoll(3000);
+    builder.setup_sqpoll(3000); // 开启 SQPOLL（3秒自动休眠），内核线程会自动轮询提交
     let ring = builder.build(uring_queue_depth)?;
-    ring.submitter().register_files(&[target])?;
+    ring.submitter().register_files(&[target])?; // 注册文件句柄，加速 IO
     Ok(ring)
 }
 
+/// Submission Queue (SQ) 线程：轮询 READY 状态的 Slab 并提交给磁盘
 fn spawn_sq_thread(
     cancellation_token: CancellationToken,
     slab_capacity: usize,
@@ -787,7 +779,7 @@ fn spawn_sq_thread(
     uring_inflight_limit: usize,
     idle_spin_limit: usize,
 ) -> SQR {
-    const FD_URING_SLOT: u32 = 0;
+    const FD_URING_SLOT: u32 = 0; // 对应注册文件的索引
 
     spawn(move || {
         let mut mut_hist = Histogram::new_with_max(6000_0000, 4)?;
@@ -807,6 +799,7 @@ fn spawn_sq_thread(
         loop {
             ready_slabs.clear();
 
+            // 1. 扫描就绪的 Slab
             wal.ring.fetch_ready_slabs(
                 uring_inflight_limit,
                 idle_spin_limit,
@@ -817,27 +810,22 @@ fn spawn_sq_thread(
             );
 
             if ready_slabs.is_empty() {
-                if cancellation_token.is_cancelled() {
-                    break;
-                }
+                if cancellation_token.is_cancelled() { break; }
                 idle_loop += 1.;
                 spin_loop();
                 continue;
             }
 
             submit_loop += 1.;
-
             sq_batch_hist.saturating_record(ready_slabs.len().into_lossy());
 
+            // 2. 将就绪块批量压入 io_uring 提交队列
             for &cursor in &ready_slabs {
                 let slab = wal.ring.slab(cursor);
-
                 let mut_elapsed = slab.mark_inflight(cursor);
                 mut_hist.saturating_record(mut_elapsed.as_micros().into_lossy());
 
-                let sqe_write = slab
-                    .op_write(FD_URING_SLOT, cursor)
-                    .user_data(cursor.into_lossy());
+                let sqe_write = slab.op_write(FD_URING_SLOT, cursor).user_data(cursor.into_lossy());
                 unsafe {
                     while sq.push(&sqe_write).is_err() {
                         sq.sync();
@@ -847,21 +835,18 @@ fn spawn_sq_thread(
                 }
             }
 
+            // 3. 提交磁盘 IO
             sq.sync();
             submitter.submit()?;
 
             wal.submit_cursor.store(submit_cursor, Ordering::Relaxed);
         }
 
-        Ok((
-            mut_hist,
-            retire_hist,
-            sq_batch_hist,
-            idle_loop / (idle_loop + submit_loop),
-        ))
+        Ok((mut_hist, retire_hist, sq_batch_hist, idle_loop / (idle_loop + submit_loop)))
     })
 }
 
+/// Completion Queue (CQ) 线程：轮询 io_uring 的完成事件并更新 LSN
 fn spawn_cq_thread(
     cancellation_token: CancellationToken,
     wal: Arc<WalSystem>,
@@ -880,12 +865,10 @@ fn spawn_cq_thread(
             cq.sync();
 
             let mut lsn = 0;
+            // 1. 处理所有已完成的 IO 事件
             for cqe in &mut cq {
                 lsn += 1;
-
-                if cqe.result() < 0 {
-                    bail!("I/O");
-                }
+                if cqe.result() < 0 { bail!("I/O Error"); }
 
                 let cursor = cqe.user_data().into_lossy();
                 let submit_elapsed = wal.ring.slab(cursor).mark_completed(cursor);
@@ -893,25 +876,19 @@ fn spawn_cq_thread(
             }
 
             if lsn == 0 {
-                if cancellation_token.is_cancelled() {
-                    break;
-                }
+                if cancellation_token.is_cancelled() { break; }
                 idle_loop += 1.;
                 spin_loop();
                 continue;
             }
 
             complete_loop += 1.;
-
             cq_batch_hist.saturating_record(lsn);
 
+            // 2. 推进已持久化指针并重用已完成的 Slab
             wal.ring.advance_persisted_lsn();
         }
 
-        Ok((
-            submit_hist,
-            cq_batch_hist,
-            idle_loop / (idle_loop + complete_loop),
-        ))
+        Ok((submit_hist, cq_batch_hist, idle_loop / (idle_loop + complete_loop)))
     })
 }
