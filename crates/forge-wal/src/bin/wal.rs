@@ -1,3 +1,5 @@
+use std::os::fd::AsRawFd;
+
 use anyhow::{Ok, Result};
 use forge_wal::wal::system::{WalSystem, WalSystemMetrics};
 use tokio_util::sync::CancellationToken;
@@ -8,7 +10,7 @@ async fn main() -> Result<()> {
     let token = CancellationToken::new();
 
     // slab_capacity=32, slab_amount=3 → 只有 3 个物理 slab 组成环
-    let (wal, _sq, _cq) = WalSystem::bootstrap(token.clone(), file, 32, 3, 0, 0)?;
+    let (wal, sq, cq) = WalSystem::bootstrap(token.clone(), file.as_raw_fd(), 32, 3, 0, 0)?;
 
     static METRICS: WalSystemMetrics = WalSystemMetrics;
 
@@ -42,6 +44,16 @@ async fn main() -> Result<()> {
     println!("[slab 4] partial write, inflight = {}", wal.inflight());
 
     println!("done");
-    // drop 时 flush_remaining 会把最后未满的 slab 刷盘
+
+    wal.ring.flush_remaining_for_shutdown();
+
+    while wal.inflight() > 0 {
+        std::hint::spin_loop();
+    }
+
+    token.cancel();
+
+    sq.join().expect("SQ thread panicked")?;
+    cq.join().expect("CQ thread panicked")?;
     Ok(())
 }

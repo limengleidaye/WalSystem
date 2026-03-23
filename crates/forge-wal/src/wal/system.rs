@@ -5,14 +5,16 @@ use std::{
     fs::{File, OpenOptions},
     os::fd::AsRawFd,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
-use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::wal::{
     io::{CQR, SQR, spawn_cq_thread, spawn_sq_thread},
-    ring::{ReserveAction, SlabRing},
+    ring::SlabRing,
 };
 
 pub struct WalSystemMetrics;
@@ -36,7 +38,8 @@ impl WalSystemMetrics {
 }
 
 pub struct WalSystem {
-    pub(crate) ring: Arc<Mutex<SlabRing>>,
+    pub ring: SlabRing,
+    pub(crate) submit_cursor: AtomicUsize,
 }
 
 impl WalSystem {
@@ -61,7 +64,7 @@ impl WalSystem {
 
     pub fn bootstrap(
         cancellation_token: CancellationToken,
-        file: File,
+        fd: i32,
         slab_capacity: usize,
         slab_amount: usize,
         uring_queue_depth: u32,
@@ -75,13 +78,13 @@ impl WalSystem {
         let slab_amount = if slab_amount == 0 { 4 } else { slab_amount };
         let uring_queue_depth = uring_queue_depth.max(8);
         let uring_inflight_limit = uring_inflight_limit.max(1);
-        let fd = file.as_raw_fd();
 
         let wal = Arc::new(WalSystem {
-            ring: Arc::new(Mutex::new(SlabRing::new(slab_capacity, slab_amount))),
+            ring: SlabRing::new(slab_capacity, slab_amount),
+            submit_cursor: AtomicUsize::new(0),
         });
 
-        let uring = Arc::new(Mutex::new(IoUring::new(uring_queue_depth)?));
+        let uring = Arc::new(IoUring::new(uring_queue_depth)?);
 
         let sq = spawn_sq_thread(
             cancellation_token.clone(),
@@ -110,50 +113,18 @@ impl WalSystem {
         if cancellation_token.is_cancelled() {
             bail!("wal reserve cancelled");
         }
-        let mut sink = Some(sink);
-
-        let written = loop {
-            let action = {
-                let mut ring = self.ring.lock().expect("wal mutex poisoned");
-                ring.reserve_once(capacity, &mut sink)?
-            };
-
-            match action {
-                ReserveAction::Wait(notify) => {
-                    if cancellation_token.is_cancelled() {
-                        bail!("wal reserve cancelled");
-                    }
-                    notify.notified().await;
-                }
-                ReserveAction::Written { cursor, notify } => break (cursor, notify),
-            }
-        };
-        let (cursor, notify) = written;
-
-        loop {
-            {
-                let ring = self.ring.lock().expect("wal mutex poisoned");
-                if ring.is_persisted(cursor) {
-                    return Ok(());
-                }
-            }
-
-            if cancellation_token.is_cancelled() {
-                bail!("wal reserve cancelled");
-            }
-            notify.notified().await;
-        }
+        self.ring.reserve(capacity, sink, cancellation_token).await
     }
 
     pub fn inflight(&self) -> usize {
-        let ring = self.ring.lock().expect("wal mutex poisoned");
-        ring.inflight()
+        let submit = self.submit_cursor.load(Ordering::Relaxed);
+        let persist = self.ring.persist_cursor();
+        submit.saturating_sub(persist)
     }
 }
 
 impl Drop for WalSystem {
     fn drop(&mut self) {
-        let mut ring = self.ring.lock().expect("wal mutex poisoned");
-        let _ = ring.flush_remaining_for_shutdown();
+        self.ring.flush_remaining_for_shutdown();
     }
 }
