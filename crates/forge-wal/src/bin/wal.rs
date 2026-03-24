@@ -1,59 +1,95 @@
-use std::os::fd::AsRawFd;
+use std::{
+    os::fd::AsRawFd,
+    sync::{Arc, atomic::AtomicUsize},
+    time::Instant,
+};
 
 use anyhow::{Ok, Result};
 use forge_wal::wal::system::{WalSystem, WalSystemMetrics};
 use tokio_util::sync::CancellationToken;
 
+static METRICS: WalSystemMetrics = WalSystemMetrics;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let file = WalSystem::create_target("wal.log", 0, false)?;
+    let total_tasks: usize = 10_000;
+    let producer_count: usize = 64;
+    let slab_capacity: usize = 4096;
+    let slab_amount: usize = 64;
+    let write_size: usize = 128;
+
+    let preallocate = (total_tasks * write_size) as u64;
+    let file = WalSystem::create_target("wal.log", preallocate, false)?;
     let token = CancellationToken::new();
 
-    // slab_capacity=32, slab_amount=3 → 只有 3 个物理 slab 组成环
-    let (wal, sq, cq) = WalSystem::bootstrap(token.clone(), file.as_raw_fd(), 32, 3, 0, 0)?;
+    let (wal, sq, cq) = WalSystem::bootstrap(
+        token.clone(),
+        file.as_raw_fd(),
+        slab_capacity,
+        slab_amount,
+        64,
+        32,
+    )?;
 
-    static METRICS: WalSystemMetrics = WalSystemMetrics;
+    let completed = Arc::new(AtomicUsize::new(0));
+    let tasks_per_producer = total_tasks / producer_count;
 
-    // 写满第 1 个 slab（逻辑编号 0）
-    wal.reserve(32, |w| w[..3].copy_from_slice(b"AAA"), &METRICS, &token)
-        .await?;
-    println!("[slab 0] filled, inflight = {}", wal.inflight());
+    let start = Instant::now();
 
-    // 写满第 2 个 slab（逻辑编号 1）
-    wal.reserve(32, |w| w[..3].copy_from_slice(b"BBB"), &METRICS, &token)
-        .await?;
-    println!("[slab 1] filled, inflight = {}", wal.inflight());
+    let handles: Vec<_> = (0..producer_count)
+        .map(|id| {
+            let wal = wal.clone();
+            let token = token.clone();
+            let completed = completed.clone();
 
-    // 写满第 3 个 slab（逻辑编号 2）
-    wal.reserve(32, |w| w[..3].copy_from_slice(b"CCC"), &METRICS, &token)
-        .await?;
-    println!("[slab 2] filled, inflight = {}", wal.inflight());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    for i in 0..tasks_per_producer {
+                        let seq = id * tasks_per_producer + i;
+                        wal.reserve(
+                            write_size,
+                            |w| {
+                                let bytes = seq.to_le_bytes();
+                                w[..8].copy_from_slice(&bytes);
+                            },
+                            &METRICS,
+                            &token,
+                        )
+                        .await
+                        .unwrap();
+                        completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+        })
+        .collect();
 
-    // 第 4 次写入 → 触发背压，必须先刷盘才能继续
-    // 这里验证了环的核心：物理 slab[0] 被回收复用，逻辑编号变为 3
-    wal.reserve(32, |w| w[..3].copy_from_slice(b"DDD"), &METRICS, &token)
-        .await?;
+    for handle in handles {
+        handle.join().expect("producer panicked");
+    }
+
+    let elapsed = start.elapsed();
+    let total = completed.load(std::sync::atomic::Ordering::Relaxed);
+
     println!(
-        "[slab 3] filled (reused physical 0), inflight = {}",
-        wal.inflight()
+        "done: {} tasks in {:.2?}, throughput = {:.0} ops/s",
+        total,
+        elapsed,
+        total as f64 / elapsed.as_secs_f64(),
     );
 
-    // 再来一次，部分写入（不满），验证 drop 时刷盘
-    wal.reserve(10, |w| w[..3].copy_from_slice(b"EEE"), &METRICS, &token)
-        .await?;
-    println!("[slab 4] partial write, inflight = {}", wal.inflight());
-
-    println!("done");
-
+    // 刷盘 + 等待 inflight 归零
     wal.ring.flush_remaining_for_shutdown();
-
     while wal.inflight() > 0 {
         std::hint::spin_loop();
     }
 
     token.cancel();
-
-    sq.join().expect("SQ thread panicked")?;
-    cq.join().expect("CQ thread panicked")?;
+    sq.join().expect("SQ panicked")?;
+    cq.join().expect("CQ panicked")?;
     Ok(())
 }

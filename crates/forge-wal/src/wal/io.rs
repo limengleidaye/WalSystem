@@ -4,26 +4,23 @@ use anyhow::Result;
 use anyhow::bail;
 use io_uring::IoUring;
 use io_uring::opcode;
-use io_uring::types;
-use std::fs::read;
+use io_uring::types::Fixed;
 use std::hint::spin_loop;
-use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 pub type SQR = JoinHandle<Result<()>>;
 pub type CQR = JoinHandle<Result<()>>;
 
+const FD_SLOT: u32 = 0; // register_files 注册的第 0 个 fd   
+
 pub fn spawn_sq_thread(
     cancellation_token: CancellationToken,
     wal: Arc<WalSystem>,
     uring: Arc<IoUring>,
-    fd: RawFd,
     inflight_limit: usize,
     idle_spin_limit: usize,
 ) -> SQR {
@@ -59,11 +56,16 @@ pub fn spawn_sq_thread(
                 let slab = wal.ring.slab(cursor);
                 slab.mark_inflight(cursor);
 
-                let entry =
-                    opcode::Write::new(types::Fd(fd), slab.as_ptr(), slab.len_for_flush() as u32)
-                        .offset((cursor * slab.capacity()) as u64)
-                        .build()
-                        .user_data(cursor as u64);
+                let entry = opcode::WriteFixed::new(
+                    Fixed(FD_SLOT),
+                    slab.as_ptr(),
+                    slab.len_for_flush() as u32,
+                    slab.uring_slot(),
+                )
+                .offset((cursor * slab.capacity()) as u64)
+                .rw_flags(libc::RWF_DSYNC)
+                .build()
+                .user_data(cursor as u64);
                 unsafe {
                     while sq.push(&entry).is_err() {
                         sq.sync();

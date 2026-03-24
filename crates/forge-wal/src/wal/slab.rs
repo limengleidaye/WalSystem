@@ -1,8 +1,8 @@
+use crate::wal::CL;
 use anyhow::Result;
 use anyhow::bail;
-use std::intrinsics::write_bytes;
-use std::slice::from_raw_parts_mut;
-use std::sync::Arc;
+use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::ptr::write_bytes;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
@@ -14,29 +14,102 @@ pub const SLAB_WRITING: usize = 0b0001;
 pub const SLAB_READY: usize = 0b0010;
 pub const SLAB_IN_FLIGHT: usize = 0b0100;
 pub const SLAB_COMPLETED: usize = 0b1000;
+const MEMORY_PAGE: usize = 4096;
+
+pub struct RegisteredMemory {
+    pub ptr: *mut u8,
+    pub uring_slot: u16,
+    layout: Layout,
+}
+
+impl RegisteredMemory {
+    /// 分配 `total_size` 字节的 4096 对齐内存，注册到 io_uring
+    pub fn build_and_register(
+        slab_capacity: usize,
+        slab_amount: usize,
+        submitter: &io_uring::Submitter,
+    ) -> Result<Vec<RegisteredMemory>> {
+        let mem_size = 16 * 1024 * 1024;
+        let slabs_per_mem = mem_size / slab_capacity;
+        let mem_count = slab_amount.div_ceil(slabs_per_mem);
+
+        let layout = Layout::from_size_align(mem_size, MEMORY_PAGE)?;
+
+        let mut memories = Vec::with_capacity(mem_count);
+        let mut iovecs = Vec::with_capacity(mem_count);
+
+        for slot in 0..mem_count {
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if ptr.is_null() {
+                bail!("alloc_zeroed failed");
+            }
+            memories.push(RegisteredMemory {
+                ptr,
+                uring_slot: slot as u16,
+                layout,
+            });
+            iovecs.push(libc::iovec {
+                iov_base: ptr as *mut _,
+                iov_len: mem_size,
+            });
+        }
+
+        unsafe {
+            submitter.register_buffers(&iovecs)?;
+        }
+        Ok(memories)
+    }
+}
+
+impl Drop for RegisteredMemory {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
+unsafe impl Send for RegisteredMemory {}
+unsafe impl Sync for RegisteredMemory {}
 
 /// 一个固定大小的内存块，多次写入共享同一个 buffer
 pub struct Slab {
-    buf: Vec<u8>,                 // 固定大小的缓冲区
-    state: AtomicU64,             // 打包 owner(高位) + state(低4位)
-    capacity: usize,              // buf 的总容量
-    assigned: AtomicUsize,        // 已分配出去的偏移量（下一次写入的起始位置）
-    written: AtomicUsize,         // 已实际写完的字节数
-    pending_writers: AtomicUsize, // 当前活跃的写入者数量
-    waker: Notify,                // 唤醒等待持久化的 producer
+    ptr: *mut u8,    // 指向 RegisteredMemory 中的偏移
+    uring_slot: u16, // 对应哪块 RegisteredMemory
+    // buf: Vec<u8>,                     // 固定大小的缓冲区
+    capacity: usize,                  // buf 的总容量
+    state: CL<AtomicU64>,             // 打包 owner(高位) + state(低4位)
+    assigned: CL<AtomicUsize>,        // 已分配出去的偏移量（下一次写入的起始位置）
+    written: CL<AtomicUsize>,         // 已实际写完的字节数
+    pending_writers: CL<AtomicUsize>, // 当前活跃的写入者数量
+    waker: Notify,                    // 唤醒等待持久化的 producer
 }
 
 impl Slab {
-    pub fn new(capacity: usize, owner: usize) -> Self {
-        Self {
-            buf: vec![0u8; capacity],
-            state: AtomicU64::new(Self::pack(owner, SLAB_NONE)),
-            capacity: capacity,
-            assigned: AtomicUsize::new(0),
-            written: AtomicUsize::new(0),
-            pending_writers: AtomicUsize::new(0),
-            waker: Notify::new(),
-        }
+    pub fn build(registered_memories: &[RegisteredMemory], slab_capacity: usize) -> Vec<Slab> {
+        let mem_size = 16 * 1024 * 1024;
+        let slabs_per_mem = mem_size / slab_capacity;
+
+        registered_memories
+            .iter()
+            .enumerate()
+            .flat_map(|(slot_group, mem)| {
+                (0..slabs_per_mem).map(move |i| {
+                    let global_index = slot_group * slabs_per_mem + i;
+                    let ptr = unsafe { mem.ptr.add(i * slab_capacity) };
+                    Slab {
+                        ptr,
+                        capacity: slab_capacity,
+                        uring_slot: mem.uring_slot,
+                        state: AtomicU64::new(Slab::pack(global_index, SLAB_NONE)).into(),
+                        assigned: AtomicUsize::new(0).into(),
+                        written: AtomicUsize::new(0).into(),
+                        pending_writers: AtomicUsize::new(0).into(),
+                        waker: Notify::new(),
+                    }
+                })
+            })
+            .collect()
     }
 
     fn pack(owner: usize, state: usize) -> u64 {
@@ -58,7 +131,7 @@ impl Slab {
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.buf.as_ptr()
+        self.ptr
     }
 
     // ---- 引用计数 ----
@@ -116,10 +189,7 @@ impl Slab {
 
     /// 获取 slab 内指定区域的可写切片（调用方需保证不与其他写入者重叠）
     pub fn slice_at(&self, offset: usize, len: usize) -> &mut [u8] {
-        unsafe {
-            let ptr = self.buf.as_ptr().add(offset) as *mut u8;
-            from_raw_parts_mut(ptr, len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(offset), len) }
     }
 
     /// 标记一段写入完成，返回写完后的 written 总量
@@ -130,7 +200,7 @@ impl Slab {
     pub fn submit_with_padding(&self, assigned: usize) -> usize {
         let padding = self.capacity - assigned;
         unsafe {
-            let ptr = self.buf.as_ptr().add(assigned) as *mut u8;
+            let ptr = self.ptr.add(assigned) as *mut u8;
             write_bytes(ptr, 0, padding);
         };
         self.complete_write(padding)
@@ -156,5 +226,9 @@ impl Slab {
         self.written.store(0, Ordering::Relaxed);
         self.state
             .store(Self::pack(new_owner, SLAB_NONE), Ordering::Relaxed);
+    }
+
+    pub fn uring_slot(&self) -> u16 {
+        self.uring_slot
     }
 }

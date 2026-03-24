@@ -1,23 +1,18 @@
 use anyhow::bail;
 use std::{
-    fs::File,
     hint::spin_loop,
-    io::{Seek, SeekFrom},
-    slice::SplitInclusive,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
 };
-use tokio::{
-    sync::Notify,
-    task::{LocalEnterGuard, yield_now},
-};
+use tokio::task::yield_now;
 use tokio_util::sync::CancellationToken;
 
 use anyhow::{Ok, Result};
 
+use crate::wal::CL;
+
 use crate::wal::slab::{SLAB_COMPLETED, SLAB_IN_FLIGHT, SLAB_NONE, SLAB_READY, SLAB_WRITING, Slab};
+
+use crate::wal::slab::RegisteredMemory;
 
 pub struct Submission {
     pub cursor: usize,
@@ -32,24 +27,26 @@ pub struct SlabRing {
     slab_amount: usize,
 
     // persist_cursor <= used_cursor
-    persist_cursor: AtomicUsize, // 已持久化完成的逻辑编号（下一个待持久化的位置）
-    used_cursor: AtomicUsize,    // 当前正在被写入的逻辑编号
+    persist_cursor: CL<AtomicUsize>, // 已持久化完成的逻辑编号（下一个待持久化的位置）
+    used_cursor: CL<AtomicUsize>,    // 当前正在被写入的逻辑编号
 }
 
 unsafe impl Send for SlabRing {}
 unsafe impl Sync for SlabRing {}
 
 impl SlabRing {
-    pub fn new(slab_capacity: usize, slab_amount: usize) -> Self {
-        let slabs: Vec<Slab> = (0..slab_amount)
-            .map(|i| Slab::new(slab_capacity, i))
-            .collect();
+    pub fn new(
+        registered_memories: &[RegisteredMemory],
+        slab_capacity: usize,
+        slab_amount: usize,
+    ) -> Self {
+        let slabs: Vec<Slab> = Slab::build(registered_memories, slab_capacity);
         Self {
             slabs,
             slab_capacity,
             slab_amount,
-            used_cursor: AtomicUsize::new(0),
-            persist_cursor: AtomicUsize::new(0),
+            used_cursor: AtomicUsize::new(0).into(),
+            persist_cursor: AtomicUsize::new(0).into(),
         }
     }
 
@@ -66,7 +63,6 @@ impl SlabRing {
     }
 
     fn try_advance_used_cursor(&self, cursor: usize) {
-        println!("current cursor: {}", cursor);
         let _ = self.used_cursor.compare_exchange(
             cursor,
             cursor + 1,
@@ -135,10 +131,10 @@ impl SlabRing {
                 let slice = slab.slice_at(assigned, capacity);
                 slice.fill(0);
                 sink(slice);
-                slab.release_ref();
                 // 先注册 notified future，再 complete_write，避免错过通知
                 let fut = slab.waker().notified();
                 let written = slab.complete_write(capacity);
+                slab.release_ref();
                 // 如果我是最后一个写完的人，负责 mark_ready
                 if written == slab.capacity() {
                     slab.mark_ready(owner);
