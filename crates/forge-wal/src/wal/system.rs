@@ -110,7 +110,7 @@ impl WalSystem {
             wal.clone(),
             uring.clone(),
             uring_inflight_limit,
-            128,
+            32768,
         );
 
         let cq = spawn_cq_thread(cancellation_token, wal.clone(), uring);
@@ -126,7 +126,7 @@ impl WalSystem {
         cancellation_token: &CancellationToken,
     ) -> Result<()>
     where
-        F: FnOnce(&mut [u8]),
+        F: FnOnce(&mut [u8], u32),
     {
         if cancellation_token.is_cancelled() {
             bail!("wal reserve cancelled");

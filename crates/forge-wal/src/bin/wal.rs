@@ -1,4 +1,9 @@
-use std::sync::atomic::Ordering;
+use rand::RngExt;
+use rand::SeedableRng;
+use rand::rng;
+use rand::rngs::SmallRng;
+use rand::seq;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use std::{
@@ -24,11 +29,10 @@ fn distribute(amount: usize, part: usize) -> impl Iterator<Item = usize> {
 fn main() -> Result<()> {
     let slab_capacity: usize = 256 * 1024;
     let slab_amount: usize = 256;
-    let write_size: usize = 8;
     let coop: usize = 3;
     let producer: usize = 16384;
 
-    let duration = Duration::from_secs(60);
+    let duration = Duration::from_secs(10);
 
     let preallocate = 2 * 1024 * 1024 * 1024u64; // 2 GiB
     let file = WalSystem::create_target("wal.log", preallocate, false)?;
@@ -62,12 +66,7 @@ fn main() -> Result<()> {
                 local.block_on(&rt, async {
                     let tracker = TaskTracker::new();
                     for _ in 0..tasks {
-                        tracker.spawn_local(producer_task(
-                            ops,
-                            write_size,
-                            wal.clone(),
-                            token.clone(),
-                        ));
+                        tracker.spawn_local(producer_task(ops, wal.clone(), token.clone()));
                     }
                     tracker.close();
                     tracker.wait().await;
@@ -100,7 +99,6 @@ fn main() -> Result<()> {
         handle.join().expect("producer thread panicked");
     }
 
-    wal.ring.flush_remaining_for_shutdown();
     while wal.inflight() > 0 {
         std::hint::spin_loop();
     }
@@ -115,19 +113,29 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn producer_task(
-    ops: &'static AtomicUsize,
-    write_size: usize,
-    wal: Arc<WalSystem>,
-    token: CancellationToken,
-) {
-    let mut seq: u64 = 0;
+async fn producer_task(ops: &'static AtomicUsize, wal: Arc<WalSystem>, token: CancellationToken) {
+    let mut rng = SmallRng::from_rng(&mut rng());
     while !token.is_cancelled() {
-        let s = seq;
+        let count: u16 = rng.random_range(1..=1000);
+        let values: Vec<u32> = (0..count).map(|_| rng.random_range(1..=100000)).collect();
+        let sum: u32 = values.iter().sum();
+
+        let write_size = (count as usize + 2) * 4 + 2;
         let result = wal
             .reserve(
                 write_size,
-                |w| w[..8].copy_from_slice(&s.to_le_bytes()),
+                |w, seq| {
+                    let mut off = 0;
+                    w[off..off + 2].copy_from_slice(&count.to_le_bytes());
+                    off += 2;
+                    for &v in &values {
+                        w[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                        off += 4;
+                    }
+                    w[off..off + 4].copy_from_slice(&sum.to_le_bytes());
+                    off += 4;
+                    w[off..off + 4].copy_from_slice(&seq.to_le_bytes());
+                },
                 &METRICS,
                 &token,
             )
@@ -136,6 +144,5 @@ async fn producer_task(
             break;
         }
         ops.fetch_add(1, Ordering::Relaxed);
-        seq += 1;
     }
 }

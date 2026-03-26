@@ -9,5 +9,6 @@ ctrlc.workspace = true
 io-uring.workspace = true
 libc.workspace = true
 num_cpus.workspace = true
+rand.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
