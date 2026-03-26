@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oxalium - WAL System Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 40px 20px;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 {
+    text-align: center;
+    font-size: 2.2em;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, #58a6ff, #bc8cff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    text-align: center;
+    color: #8b949e;
+    margin-bottom: 48px;
+    font-size: 1.1em;
+  }
+  .section {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 32px;
+    margin-bottom: 32px;
+  }
+  .section h2 {
+    font-size: 1.4em;
+    margin-bottom: 6px;
+    color: #58a6ff;
+  }
+  .section .desc {
+    color: #8b949e;
+    margin-bottom: 24px;
+    font-size: 0.95em;
+    line-height: 1.6;
+  }
+  .mermaid {
+    display: flex;
+    justify-content: center;
+    overflow-x: auto;
+  }
+  .mermaid svg { max-width: 100%; height: auto; }
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-top: 20px;
+    padding: 16px;
+    background: #0d1117;
+    border-radius: 8px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85em;
+  }
+  .legend-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 32px;
+  }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .crate-card {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 20px;
+  }
+  .crate-card h3 { color: #bc8cff; margin-bottom: 8px; }
+  .crate-card ul { padding-left: 20px; line-height: 1.8; color: #8b949e; }
+  .crate-card code {
+    background: #1c2333;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    color: #e6edf3;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Oxalium</h1>
+<p class="subtitle">High-Performance Write-Ahead Log (WAL) System based on Linux io_uring</p>
+
+<!-- ===== 1. Project Structure ===== -->
+<div class="section">
+  <h2>1. Project Structure</h2>
+  <p class="desc">Workspace contains two crates. The core crate <code>oxalium</code> implements the WAL engine, and the infrastructure crate <code>oxalium-infra</code> provides common utilities.</p>
+  <div class="grid">
+    <div class="crate-card">
+      <h3>oxalium (core)</h3>
+      <ul>
+        <li><code>lib.rs</code> -- Crate root, MiMalloc global allocator</li>
+        <li><code>wal.rs</code> -- WAL engine: WalSystem, SlabRing, Slab, RegisteredMemory, SQ/CQ threads</li>
+        <li><code>bin/pcr-2601.rs</code> -- Benchmark binary: multi-threaded producer workload</li>
+      </ul>
+    </div>
+    <div class="crate-card">
+      <h3>oxalium-infra (infra)</h3>
+      <ul>
+        <li><code>convert.rs</code> -- <code>IntoLossy</code> / <code>FromLossy</code> numeric cast traits</li>
+        <li><code>iter.rs</code> -- <code>distribute()</code> work partitioning iterator</li>
+        <li><code>process.rs</code> -- Peak memory usage (Linux /proc, Windows API)</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- ===== 2. System Bootstrap ===== -->
+<div class="section">
+  <h2>2. System Bootstrap Flow</h2>
+  <p class="desc">The benchmark binary <code>pcr-2601</code> drives the entire system. It creates the target file, bootstraps the WAL, spawns producer threads, and collects metrics.</p>
+  <div class="mermaid">
+flowchart TD
+    A["main()  parse CLI args"] --> B["WalSystem::create_target()"]
+    B --> B1["Open file\nO_DIRECT + O_NOATIME"]
+    B1 --> B2["fallocate() preallocate"]
+    B2 --> B3{"physical\npreallocate?"}
+    B3 -- Yes --> B4["Write zeroed pages\n+ sync_all"]
+    B3 -- No --> C
+    B4 --> C["WalSystem::bootstrap()"]
+    C --> C1["setup_io_uring()\nSQPOLL mode"]
+    C1 --> C2["RegisteredMemory::\nbuild_and_register()\n16MB page-aligned buffers"]
+    C2 --> C3["SlabRing::build()\nPartition memory into slabs"]
+    C3 --> C4["Arc&lt;WalSystem&gt;"]
+    C4 --> D1["spawn SQ Thread"]
+    C4 --> D2["spawn CQ Thread"]
+    D1 --> E["spawn_tpc_thread() x N\n(one per CPU core)"]
+    D2 --> E
+    E --> F["Each thread runs tokio\nLocalRuntime with M tasks"]
+    F --> G["producer_task() loop:\ngenerate payload -> reserve -> wait persist"]
+    G --> H["Main thread: 1s interval\nprint ops/sec + inflight"]
+    H --> I{"Duration elapsed\nor Ctrl+C?"}
+    I -- No --> H
+    I -- Yes --> J["Cancel producers\nthen cancel WAL"]
+    J --> K["Collect & print\nhistograms + metrics"]
+
+    style A fill:#1f6feb,stroke:#58a6ff,color:#fff
+    style C4 fill:#8957e5,stroke:#bc8cff,color:#fff
+    style G fill:#238636,stroke:#3fb950,color:#fff
+    style K fill:#da3633,stroke:#f85149,color:#fff
+  </div>
+</div>
+
+<!-- ===== 3. Slab State Machine ===== -->
+<div class="section">
+  <h2>3. Slab State Machine</h2>
+  <p class="desc">Each Slab is a fixed-size write buffer. It cycles through states managed by atomic CAS operations, coordinating producers, the SQ thread, and the CQ thread.</p>
+  <div class="mermaid">
+stateDiagram-v2
+    direction LR
+
+    [*] --> NONE : reuse()
+
+    NONE --> WRITING : try_claim()\nCAS success
+
+    WRITING --> WRITING : prepare_write()\ncomplete_write()\n(partial fill)
+
+    WRITING --> READY : mark_ready()\nslab full or\nidle-spin retire
+
+    READY --> IN_FLIGHT : mark_inflight()\nSQ thread submits\nio_uring write
+
+    IN_FLIGHT --> COMPLETED : mark_completed()\nCQ thread receives\ncompletion event
+
+    COMPLETED --> NONE : advance_persisted_lsn()\nnotify_waiters()\nreuse()
+
+    note right of NONE : Available for new writes\nowner = next cursor
+    note right of WRITING : Producers writing concurrently\nassigned/written counters
+    note right of READY : All bytes committed\nawaiting io_uring submit
+    note right of IN_FLIGHT : io_uring DSYNC write pending
+    note right of COMPLETED : I/O done, pending LSN advance
+  </div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#58a6ff"></div>NONE - idle, awaiting claim</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#3fb950"></div>WRITING - producers filling data</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#d29922"></div>READY - full, queued for I/O</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#bc8cff"></div>IN_FLIGHT - io_uring write submitted</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f85149"></div>COMPLETED - I/O done, pending recycle</div>
+  </div>
+</div>
+
+<!-- ===== 4. Write Path (Data Flow) ===== -->
+<div class="section">
+  <h2>4. Write Path -- Data Flow</h2>
+  <p class="desc">The end-to-end data flow from a producer task reserving slab space, through io_uring submission and completion, to the persistence acknowledgment.</p>
+  <div class="mermaid">
+flowchart LR
+    subgraph Producers ["Async Producer Tasks (tokio)"]
+      P1["producer_task #1"]
+      P2["producer_task #2"]
+      PN["producer_task #N"]
+    end
+
+    subgraph SlabRing ["SlabRing (lock-free ring buffer)"]
+      direction TB
+      S0["Slab 0"]
+      S1["Slab 1"]
+      S2["Slab 2"]
+      SD["..."]
+      SK["Slab K"]
+    end
+
+    subgraph IO ["I/O Threads (OS threads)"]
+      direction TB
+      SQ["SQ Thread\n- poll READY slabs\n- build WriteFixed SQE\n- submit to io_uring"]
+      CQ["CQ Thread\n- drain CQEs\n- mark_completed\n- advance_persisted_lsn\n- notify_waiters"]
+    end
+
+    subgraph Kernel ["Linux Kernel"]
+      UR["io_uring\nSQPOLL + RWF_DSYNC"]
+      DISK["Target File\n(O_DIRECT)"]
+    end
+
+    P1 & P2 & PN -->|"reserve()\natomic assign + write"| SlabRing
+    SlabRing -->|"READY slabs"| SQ
+    SQ -->|"WriteFixed SQE"| UR
+    UR -->|"DMA write"| DISK
+    DISK -->|"CQE completion"| CQ
+    CQ -->|"notify_waiters()\npersist_cursor++"| SlabRing
+    SlabRing -.->|"await Notify\nthen return Ok"| Producers
+
+    style Producers fill:#0d1117,stroke:#3fb950,color:#c9d1d9
+    style SlabRing fill:#0d1117,stroke:#d29922,color:#c9d1d9
+    style IO fill:#0d1117,stroke:#58a6ff,color:#c9d1d9
+    style Kernel fill:#0d1117,stroke:#f85149,color:#c9d1d9
+  </div>
+</div>
+
+<!-- ===== 5. SlabRing Reserve Flow ===== -->
+<div class="section">
+  <h2>5. SlabRing::reserve() Detail</h2>
+  <p class="desc">The core lock-free algorithm that allows thousands of concurrent producers to write into shared slabs without mutexes. Uses exponential back-off spin + tokio yield.</p>
+  <div class="mermaid">
+flowchart TD
+    START(["reserve(capacity, sink)"]) --> LOAD["Load used_cursor\nLoad persist_cursor"]
+    LOAD --> FULL{"used_cursor >=\npersist_cursor\n+ slab_amount?"}
+    FULL -- Yes --> BP["Record backpressure\nasync_spin_loop()"]
+    BP --> LOAD
+    FULL -- No --> REF["slab = slab(used_cursor)\nslab.acquire_ref()"]
+    REF --> OWNER{"owner ==\nused_cursor?"}
+    OWNER -- No --> RELEASE1["release_ref()\nrecord owner_mismatch\nasync_spin_loop()"]
+    RELEASE1 --> LOAD
+    OWNER -- Yes --> STATE{"state ==\nNONE?"}
+    STATE -- Yes --> CAS["try_claim()\nCAS: NONE -> WRITING"]
+    CAS --> CAS_OK{"CAS success?"}
+    CAS_OK -- No --> CONT["record claim_contention"]
+    CONT --> CHECK_W{"still same owner\n& WRITING?"}
+    CHECK_W -- No --> RELEASE1
+    CHECK_W -- Yes --> ASSIGN
+    CAS_OK -- Yes --> ASSIGN
+    STATE -- "WRITING" --> ASSIGN
+    ASSIGN["assigned = prepare_write(capacity)"]
+    ASSIGN --> FIT{"assigned + capacity\n<= slab_capacity?"}
+
+    FIT -- Yes --> WRITE["sink(slab buffer)\ncomplete_write()"]
+    WRITE --> MARK_R{"written ==\nslab_capacity?"}
+    MARK_R -- Yes --> MR["mark_ready(owner)"]
+    MARK_R -- No --> WAIT
+    MR --> WAIT
+
+    FIT -- "No (padding)" --> PAD["submit_with_padding()\nrelease_ref()"]
+    PAD --> MARK_R2{"written ==\nslab_capacity?"}
+    MARK_R2 -- Yes --> MR2["mark_ready(owner)"]
+    MARK_R2 -- No --> ADV
+    MR2 --> ADV["advance_used_cursor"]
+    ADV --> LOAD
+
+    FIT -- "No (overflow)" --> ADV2["release_ref()\nadvance_used_cursor"]
+    ADV2 --> LOAD
+
+    WAIT{"is_persisted?"}
+    WAIT -- Yes --> DONE(["return Ok(())"])
+    WAIT -- No --> NOTIFY["await Notify\nthen spin until persisted"]
+    NOTIFY --> DONE
+
+    style START fill:#1f6feb,stroke:#58a6ff,color:#fff
+    style DONE fill:#238636,stroke:#3fb950,color:#fff
+    style BP fill:#da3633,stroke:#f85149,color:#fff
+    style WRITE fill:#8957e5,stroke:#bc8cff,color:#fff
+  </div>
+</div>
+
+<!-- ===== 6. Thread Architecture ===== -->
+<div class="section">
+  <h2>6. Thread Architecture</h2>
+  <p class="desc">The system uses a combination of OS threads for I/O and per-core tokio runtimes for producers. The number of producer threads is <code>num_cpus - coop</code>, with tasks distributed evenly.</p>
+  <div class="mermaid">
+flowchart TB
+    subgraph Main ["Main Thread"]
+      MAIN["CLI parse\nBootstrap\nProgress print\nShutdown"]
+    end
+
+    subgraph WAL ["WAL I/O (OS Threads)"]
+      SQ["SQ Thread\nSubmission Queue polling\nspin_loop when idle"]
+      CQ["CQ Thread\nCompletion Queue draining\nspin_loop when idle"]
+    end
+
+    subgraph TPC ["TPC Threads (OS Threads x num_cpus-coop)"]
+      T1["Thread 1\ntokio LocalRuntime"]
+      T2["Thread 2\ntokio LocalRuntime"]
+      TN["Thread N\ntokio LocalRuntime"]
+    end
+
+    subgraph Tasks1 ["Tasks on Thread 1"]
+      TA1["producer_task"]
+      TA2["producer_task"]
+      TAM["... x M"]
+    end
+
+    subgraph Shared ["Shared State (Arc)"]
+      WS["Arc&lt;WalSystem&gt;\n- SlabRing\n- RegisteredMemory\n- submit_cursor"]
+      RING["Arc&lt;IoUring&gt;\n- submission_shared()\n- completion_shared()"]
+    end
+
+    MAIN --> WAL
+    MAIN --> TPC
+    T1 --> Tasks1
+    T1 & T2 & TN -->|"Arc clone"| WS
+    SQ & CQ -->|"Arc clone"| WS
+    SQ & CQ -->|"Arc clone"| RING
+
+    style Main fill:#1f6feb,stroke:#58a6ff,color:#fff
+    style WAL fill:#0d1117,stroke:#f85149,color:#c9d1d9
+    style TPC fill:#0d1117,stroke:#3fb950,color:#c9d1d9
+    style Shared fill:#0d1117,stroke:#d29922,color:#c9d1d9
+  </div>
+</div>
+
+<!-- ===== 7. Memory Layout ===== -->
+<div class="section">
+  <h2>7. Memory Layout</h2>
+  <p class="desc">RegisteredMemory buffers are 16MB page-aligned blocks registered with io_uring. Each is partitioned into equal-sized slabs. All slab metadata is 64-byte (cache-line) aligned to prevent false sharing.</p>
+  <div class="mermaid">
+flowchart LR
+    subgraph RM0 ["RegisteredMemory #0  (16 MB, 4096-aligned)"]
+      direction LR
+      S0["Slab 0\n(slab_capacity)"]
+      S1["Slab 1"]
+      S2["Slab 2"]
+      SD["..."]
+    end
+
+    subgraph RM1 ["RegisteredMemory #1  (16 MB)"]
+      direction LR
+      S3["Slab K"]
+      S4["Slab K+1"]
+      S5["Slab K+2"]
+      SE["..."]
+    end
+
+    subgraph SlabDetail ["Slab Internal Layout"]
+      direction TB
+      HDR["[0..8] reserved header\n(owner u64 written on inflight)"]
+      DATA["[8..assigned] producer data\n(copy_nonoverlapping)"]
+      PAD["[assigned..capacity] zero padding"]
+    end
+
+    subgraph Meta ["Slab Metadata (cache-line aligned)"]
+      direction TB
+      M1["SlabProperties (64B)\ncapacity, ptr, uring_slot"]
+      M2["SlabMetrics (64B)\nmut_inst, mut_elapsed, submit_inst"]
+      M3["state: CL&lt;AtomicU64&gt; (64B)\npacked (cursor, state)"]
+      M4["pending_writers: CL&lt;AtomicUsize&gt;"]
+      M5["assigned / written: CL&lt;AtomicUsize&gt;"]
+    end
+
+    RM0 --> SlabDetail
+    S0 --> Meta
+
+    style RM0 fill:#161b22,stroke:#d29922,color:#c9d1d9
+    style RM1 fill:#161b22,stroke:#d29922,color:#c9d1d9
+    style SlabDetail fill:#161b22,stroke:#58a6ff,color:#c9d1d9
+    style Meta fill:#161b22,stroke:#bc8cff,color:#c9d1d9
+  </div>
+</div>
+
+<!-- ===== 8. Metrics Collection ===== -->
+<div class="section">
+  <h2>8. Metrics & Histograms</h2>
+  <p class="desc">The system collects latency distributions at each stage using HdrHistogram, enabling precise tail-latency analysis.</p>
+  <div class="mermaid">
+flowchart LR
+    subgraph SQMetrics ["SQ Thread Metrics"]
+      MH["slab ready latency\n(mut_elapsed, us)"]
+      RH["slab retire size\n(bytes)"]
+      SBH["submission batch size"]
+      SIP["idle spin percentage"]
+    end
+
+    subgraph CQMetrics ["CQ Thread Metrics"]
+      SH["IO complete latency\n(submit_elapsed, us)"]
+      CBH["completion batch size"]
+      CIP["idle spin percentage"]
+    end
+
+    subgraph TaskM ["Per-Task Metrics"]
+      TLH["task reserve latency\n(end-to-end, us)"]
+      OPS["ops counter\n(AtomicUsize)"]
+    end
+
+    subgraph SysM ["WalSystemMetrics"]
+      BP["backpressure count"]
+      OM["owner_mismatch count"]
+      CC["claim_contention count"]
+      NA["notify_await count"]
+    end
+
+    SQMetrics --> REPORT["print_thread_histogram()\nLog2 bucket distribution"]
+    CQMetrics --> REPORT
+    TaskM --> REPORT
+    SysM --> REPORT
+
+    style SQMetrics fill:#161b22,stroke:#f85149,color:#c9d1d9
+    style CQMetrics fill:#161b22,stroke:#58a6ff,color:#c9d1d9
+    style TaskM fill:#161b22,stroke:#3fb950,color:#c9d1d9
+    style SysM fill:#161b22,stroke:#d29922,color:#c9d1d9
+  </div>
+</div>
+
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    darkMode: true,
+    background: '#0d1117',
+    primaryColor: '#1f6feb',
+    primaryTextColor: '#c9d1d9',
+    primaryBorderColor: '#58a6ff',
+    lineColor: '#8b949e',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    noteBkgColor: '#161b22',
+    noteTextColor: '#c9d1d9',
+    noteBorderColor: '#30363d'
+  },
+  flowchart: { htmlLabels: true, curve: 'basis' },
+  stateDiagram: { htmlLabels: true }
+});
+</script>
+</body>
+</html>
