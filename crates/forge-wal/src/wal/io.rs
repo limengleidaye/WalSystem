@@ -47,6 +47,9 @@ pub fn spawn_sq_thread(
                 if cancellation_token.is_cancelled() {
                     break;
                 }
+                if sq.cq_overflow() {
+                    submitter.submit()?;
+                }
                 spin_loop();
                 continue;
             }

@@ -5,6 +5,7 @@ use rand::rngs::SmallRng;
 use rand::seq;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
+use std::thread::sleep;
 use std::time::Duration;
 use std::{
     iter::repeat_n,
@@ -44,7 +45,7 @@ fn main() -> Result<()> {
         file.as_raw_fd(),
         slab_capacity,
         slab_amount,
-        64,
+        4096,
         32,
     )?;
 
@@ -124,7 +125,7 @@ async fn producer_task(ops: &'static AtomicUsize, wal: Arc<WalSystem>, token: Ca
         let result = wal
             .reserve(
                 write_size,
-                |w, seq| {
+                |w| {
                     let mut off = 0;
                     w[off..off + 2].copy_from_slice(&count.to_le_bytes());
                     off += 2;
@@ -133,8 +134,6 @@ async fn producer_task(ops: &'static AtomicUsize, wal: Arc<WalSystem>, token: Ca
                         off += 4;
                     }
                     w[off..off + 4].copy_from_slice(&sum.to_le_bytes());
-                    off += 4;
-                    w[off..off + 4].copy_from_slice(&seq.to_le_bytes());
                 },
                 &METRICS,
                 &token,

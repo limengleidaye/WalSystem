@@ -1,6 +1,7 @@
 use anyhow::bail;
 use rand::seq;
 use std::{
+    fmt::Debug,
     hint::spin_loop,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -30,6 +31,19 @@ pub struct SlabRing {
     // persist_cursor <= used_cursor
     persist_cursor: CL<AtomicUsize>, // 已持久化完成的逻辑编号（下一个待持久化的位置）
     used_cursor: CL<AtomicUsize>,    // 当前正在被写入的逻辑编号
+}
+
+impl Debug for SlabRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlabRing")
+            .field("slabs", &self.slabs)
+            .field(
+                "persist_cursor",
+                &self.persist_cursor.load(Ordering::Relaxed),
+            )
+            .field("used_cursor", &self.used_cursor.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 unsafe impl Send for SlabRing {}
@@ -78,7 +92,7 @@ impl SlabRing {
     pub async fn reserve(
         &self,
         capacity: usize,
-        sink: impl FnOnce(&mut [u8], u32),
+        sink: impl FnOnce(&mut [u8]),
         cancellation_token: &CancellationToken,
     ) -> Result<()> {
         let mut step = 0;
@@ -121,9 +135,7 @@ impl SlabRing {
             }
 
             step = 0;
-            let (assigned, seq) = slab.prepare_write(capacity);
-            let assigned = assigned as usize;
-            let seq = seq as u32;
+            let assigned = slab.prepare_write(capacity);
 
             if assigned + capacity <= slab.capacity() {
                 if assigned + capacity == slab.capacity() {
@@ -133,7 +145,7 @@ impl SlabRing {
                 // 写入数据
                 let slice = slab.slice_at(assigned, capacity);
                 slice.fill(0);
-                sink(slice, seq);
+                sink(slice);
                 // 先注册 notified future，再 complete_write，避免错过通知
                 let fut = slab.waker().notified();
                 let written = slab.complete_write(capacity);
@@ -213,8 +225,7 @@ impl SlabRing {
                 *idle_spins += 1;
                 if *idle_spins >= idle_spin_limit {
                     // 强制 retire：原子抢占剩余空间
-                    let (assigned, _) = slab.prepare_write(self.slab_capacity);
-                    let assigned = assigned as usize;
+                    let assigned = slab.prepare_write(self.slab_capacity);
                     if assigned < self.slab_capacity {
                         let written = slab.submit_with_padding(assigned);
                         if written == self.slab_capacity {
@@ -270,8 +281,7 @@ impl SlabRing {
         }
 
         if state == SLAB_WRITING {
-            let (assigned, _) = slab.prepare_write(self.slab_capacity);
-            let assigned = assigned as usize;
+            let assigned = slab.prepare_write(self.slab_capacity);
             if assigned < self.slab_capacity {
                 let written = slab.submit_with_padding(assigned);
                 if written == self.slab_capacity {

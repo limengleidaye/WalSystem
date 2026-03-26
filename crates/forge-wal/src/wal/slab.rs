@@ -2,6 +2,7 @@ use crate::wal::CL;
 use anyhow::Result;
 use anyhow::bail;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::fmt::Debug;
 use std::ptr::write_bytes;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::Notify;
@@ -79,10 +80,26 @@ pub struct Slab {
     // buf: Vec<u8>,                     // 固定大小的缓冲区
     capacity: usize,                  // buf 的总容量
     state: CL<AtomicU64>,             // 打包 owner(高位) + state(低4位)
-    alloc_state: CL<AtomicU64>,       // 已分配出去的偏移量（下一次写入的起始位置）
+    alloc: CL<AtomicUsize>,           // 已分配出去的偏移量（下一次写入的起始位置）
     written: CL<AtomicUsize>,         // 已实际写完的字节数
     pending_writers: CL<AtomicUsize>, // 当前活跃的写入者数量
     waker: Notify,                    // 唤醒等待持久化的 producer
+}
+
+impl Debug for Slab {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (owner, state) = Self::unpack(self.state.load(Ordering::Relaxed));
+        f.debug_struct("Slab")
+            .field("owner", &owner)
+            .field("state", &state)
+            .field("alloc", &(self.alloc.load(Ordering::Relaxed) >> 32))
+            .field("written", &self.written.load(Ordering::Relaxed))
+            .field(
+                "pending_writers",
+                &self.pending_writers.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
 }
 
 impl Slab {
@@ -102,7 +119,7 @@ impl Slab {
                         capacity: slab_capacity,
                         uring_slot: mem.uring_slot,
                         state: AtomicU64::new(Slab::pack(global_index, SLAB_NONE)).into(),
-                        alloc_state: AtomicU64::new(0).into(),
+                        alloc: AtomicUsize::new(0).into(),
                         written: AtomicUsize::new(0).into(),
                         pending_writers: AtomicUsize::new(0).into(),
                         waker: Notify::new(),
@@ -183,26 +200,8 @@ impl Slab {
 
     /// 尝试在 slab 中预留 capacity 大小的空间
     /// 返回 Some(offset) 表示预留成功，None 表示空间不足
-    pub fn prepare_write(&self, capacity: usize) -> (u64, u64) {
-        loop {
-            let old_alloc_state = self.alloc_state.load(Ordering::Relaxed);
-            let old_assigned = old_alloc_state >> 32;
-            let old_seq = old_alloc_state as u32;
-            let new_assigned = old_assigned + capacity as u64;
-            let new_seq = old_seq + 1;
-            if self
-                .alloc_state
-                .compare_exchange(
-                    old_alloc_state,
-                    (new_assigned << 32) | new_seq as u64,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return (old_assigned, (old_seq + 1) as u64);
-            }
-        }
+    pub fn prepare_write(&self, capacity: usize) -> usize {
+        self.alloc.fetch_add(capacity, Ordering::Relaxed)
     }
 
     /// 获取 slab 内指定区域的可写切片（调用方需保证不与其他写入者重叠）
@@ -240,7 +239,7 @@ impl Slab {
 
     /// 重置 slab ,赋予新的 owner 编号以供环的下一轮复用
     pub fn reset(&self, new_owner: usize) {
-        self.alloc_state.store(0, Ordering::Relaxed);
+        self.alloc.store(0, Ordering::Relaxed);
         self.written.store(0, Ordering::Relaxed);
         self.state
             .store(Self::pack(new_owner, SLAB_NONE), Ordering::Release);

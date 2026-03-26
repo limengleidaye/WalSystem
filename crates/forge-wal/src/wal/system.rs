@@ -126,7 +126,7 @@ impl WalSystem {
         cancellation_token: &CancellationToken,
     ) -> Result<()>
     where
-        F: FnOnce(&mut [u8], u32),
+        F: FnOnce(&mut [u8]),
     {
         if cancellation_token.is_cancelled() {
             bail!("wal reserve cancelled");
